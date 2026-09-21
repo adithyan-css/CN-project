@@ -13,7 +13,12 @@ from urllib.parse import urlparse, parse_qs
 
 def make_dashboard_server(port: int, state_provider: Callable[[], dict],
                            send_handler: Callable[[dict], dict], html_page: str,
-                           browse_handler: Optional[Callable[[Optional[str]], dict]] = None) -> ThreadingHTTPServer:
+                           browse_handler: Optional[Callable[[Optional[str]], dict]] = None,
+                           simulate_handler: Optional[Callable[[dict], dict]] = None) -> ThreadingHTTPServer:
+    post_routes = {"/api/send": send_handler}
+    if simulate_handler is not None:
+        post_routes["/api/simulate"] = simulate_handler
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
@@ -49,12 +54,13 @@ def make_dashboard_server(port: int, state_provider: Callable[[], dict],
                 self.end_headers()
 
         def do_POST(self):
-            if self.path == "/api/send":
+            handler = post_routes.get(self.path)
+            if handler is not None:
                 length = int(self.headers.get("Content-Length", 0))
                 raw = self.rfile.read(length) if length else b"{}"
                 try:
                     payload = json.loads(raw.decode("utf-8"))
-                    self._send_json(send_handler(payload))
+                    self._send_json(handler(payload))
                 except Exception as e:
                     self._send_json({"error": str(e)}, status=400)
             else:
@@ -191,6 +197,14 @@ body{margin:0;background:var(--parchment);color:var(--ink);font-family:var(--fon
 .status-pill.COMPLETE{color:var(--status-good);background:rgba(29,154,108,0.08)}
 .status-pill.DEGRADED,.status-pill.FAILED{color:var(--status-bad);background:rgba(217,45,32,0.08)}
 .status-pill.IDLE{color:var(--ink-muted-48);background:var(--divider-soft)}
+.status-pill.PAUSED{color:#b25e00;background:rgba(230,126,0,0.10)}
+.health{font-size:13px;letter-spacing:-0.2px;margin-top:10px;color:var(--ink-muted-80)}
+.health.good b{color:var(--status-good)}
+.health.bad b{color:var(--status-bad)}
+.t-actions{display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap}
+.t-actions .btn-secondary{font-size:13px;padding:6px 14px}
+.tag-sim{display:inline-block;margin-left:8px;font-size:11px;font-weight:600;color:#b25e00;
+  background:rgba(230,126,0,0.10);border-radius:9999px;padding:2px 8px;vertical-align:middle}
 
 .events-log{font-family:var(--font-mono);font-size:12px;line-height:1.6;color:var(--body-muted);
   white-space:pre-wrap;height:180px;overflow-y:auto;letter-spacing:0}
@@ -222,7 +236,7 @@ body{margin:0;background:var(--parchment);color:var(--ink);font-family:var(--fon
 
 <header class="hero"><div class="hero-inner">
   <h1>Nearby Devices &amp; Network Health</h1>
-  <p>Explainable, adaptive peer selection for proximity file transfer — live.</p>
+  <p>Automatic discovery, live link health, and an agent that pauses and resumes your transfer when the link degrades.</p>
 </div></header>
 
 <main class="content">
@@ -250,17 +264,17 @@ body{margin:0;background:var(--parchment);color:var(--ink);font-family:var(--fon
   </section>
 
   <section class="card card-dark">
-    <h2 class="card-title card-title-dark">Adaptation Events</h2>
+    <h2 class="card-title card-title-dark">Agent Decisions</h2>
     <div id="events" class="events-log"></div>
   </section>
 </main>
 
 <footer class="footer">
-  PathSense MVP — transfer channel is plaintext (no TLS); auto-accept is on by default.
-  Rerouting to a different peer restarts that peer's copy of the file from the beginning;
-  resuming from a checkpoint only applies when reconnecting to the same peer.
-  The file browser below lists this node's own filesystem for convenience on a trusted
-  demo network — it is not access-controlled.
+  Review 2 prototype. A transfer always stays with the receiver you picked: when the link
+  degrades the agent pauses it, keeps every verified chunk, and resumes from the first missing
+  chunk once the link recovers. "Simulate link degradation" injects clearly labelled fake
+  measurements for a demo on a healthy network. Transfer channel is plaintext (encryption is
+  planned for Review 3); auto-accept is on. The file browser is for a trusted demo network only.
 </footer>
 
 <div class="modal-backdrop" id="browseModal" hidden>
@@ -314,7 +328,7 @@ async function tick(){
     const row = document.createElement('div');
     row.className = 'peer-row' + (sc && sc.excluded ? ' excluded' : '');
     row.innerHTML = `
-      <div class="peer-name">${p.name}${sc && sc.excluded ? '<span class="tag-excluded">excluded</span>' : ''}</div>
+      <div class="peer-name">${p.name}${sc && sc.excluded ? '<span class="tag-excluded">excluded</span>' : ''}${m.simulated ? '<span class="tag-sim">simulated</span>' : ''}</div>
       <div class="peer-stat" data-label="Latency">${fmt(m.latency_ms, 1, ' ms')}</div>
       <div class="peer-stat" data-label="Loss">${fmt(m.loss_pct, 1, '%')}</div>
       <div class="peer-stat" data-label="Throughput">${fmt(m.throughput_mbps, 1, ' Mbps')}</div>
@@ -334,12 +348,21 @@ async function tick(){
   if (!t) {
     body.innerHTML = '<div class="transfer-idle">No active transfer</div>';
   } else {
+    const h = t.link_health;
+    const healthHtml = h ? `<div class="health ${h.healthy ? 'good' : 'bad'}">Link to ${escapeHtml(t.peer_name || '')}:
+        <b>${h.healthy ? 'healthy' : 'degraded'}</b> — ${escapeHtml(h.reason)}</div>` : '';
+    const active = ['TRANSFERRING','PAUSED','DEGRADED'].includes(t.status);
+    const sim = t.simulation_remaining_sec > 0
+      ? `<span class="tag-sim">simulating degradation · ${Math.ceil(t.simulation_remaining_sec)}s</span>` : '';
     body.innerHTML = `
       <div class="transfer-active">
-        <div class="t-name">${t.file_id}</div>
+        <div class="t-name">${escapeHtml(t.file_id)} → ${escapeHtml(t.peer_name || '')}</div>
         <div class="progress-track"><div class="progress-fill" style="width:${t.progress_pct}%"></div></div>
-        <div class="t-row"><span>${t.acked_chunks} / ${t.total_chunks} chunks</span>
+        <div class="t-row"><span>${t.acked_chunks} / ${t.total_chunks} chunks (${t.progress_pct}%)</span>
           <span class="status-pill ${t.status}">${t.status}</span></div>
+        <div class="t-row"><span>Pauses: ${t.pauses} · Resumes: ${t.resumes}</span><span></span></div>
+        ${healthHtml}
+        ${active ? `<div class="t-actions"><button type="button" class="btn-secondary" onclick="simulate()">Simulate link degradation (8 s)</button>${sim}</div>` : ''}
       </div>`;
   }
 
@@ -357,6 +380,13 @@ async function sendFile(){
     body: JSON.stringify({peer_id, file_path})});
   const out = await res.json();
   if(out.error) alert('Send failed: ' + out.error);
+}
+
+async function simulate(){
+  const res = await fetch('/api/simulate', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({seconds: 8})});
+  const out = await res.json();
+  if(out.error) alert('Simulation failed: ' + out.error);
 }
 
 async function openBrowser(){

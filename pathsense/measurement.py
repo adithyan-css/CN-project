@@ -24,6 +24,7 @@ class PeerMetricsSample:
     loss_pct: float
     throughput_mbps: Optional[float]
     measured_at: float
+    simulated: bool = False   # True only for demo-injected degradation samples
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -154,6 +155,7 @@ class MetricsCollector:
         self.interval_sec = interval_sec
         self.throughput_bytes = throughput_bytes
         self._history: dict[str, list[PeerMetricsSample]] = {}
+        self._simulate_until: dict[str, float] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
@@ -176,15 +178,40 @@ class MetricsCollector:
         with self._lock:
             return {pid: hist[-1] for pid, hist in self._history.items() if hist}
 
-    def measure_one(self, peer) -> PeerMetricsSample:
-        latency_ms, jitter_ms, loss_pct = probe_latency(peer.ip, peer.measurement_port)
-        throughput = measure_throughput(peer.ip, peer.measurement_port, self.throughput_bytes)
-        sample = PeerMetricsSample(peer.device_id, latency_ms, jitter_ms, loss_pct, throughput, time.time())
+    def _record(self, sample: PeerMetricsSample) -> None:
         with self._lock:
-            hist = self._history.setdefault(peer.device_id, [])
+            hist = self._history.setdefault(sample.peer_id, [])
             hist.append(sample)
             if len(hist) > self.HISTORY_LEN:
                 hist.pop(0)
+
+    # ---- demo support ------------------------------------------------------
+    # For a live demo on a healthy network, the dashboard can inject a clearly
+    # labelled, time-limited degradation for one peer. Real measurements are
+    # replaced by a synthetic bad sample until it expires; nothing else in the
+    # system is faked (the transfer itself really pauses and resumes).
+    def simulate_degradation(self, peer_id: str, seconds: float) -> None:
+        with self._lock:
+            self._simulate_until[peer_id] = time.time() + seconds
+        self._record(self._synthetic_bad_sample(peer_id))
+
+    def simulation_remaining(self, peer_id: str) -> float:
+        with self._lock:
+            return max(0.0, self._simulate_until.get(peer_id, 0.0) - time.time())
+
+    @staticmethod
+    def _synthetic_bad_sample(peer_id: str) -> PeerMetricsSample:
+        return PeerMetricsSample(peer_id, 450.0, 120.0, 40.0, 0.2, time.time(), simulated=True)
+
+    def measure_one(self, peer) -> PeerMetricsSample:
+        if self.simulation_remaining(peer.device_id) > 0:
+            sample = self._synthetic_bad_sample(peer.device_id)
+            self._record(sample)
+            return sample
+        latency_ms, jitter_ms, loss_pct = probe_latency(peer.ip, peer.measurement_port)
+        throughput = measure_throughput(peer.ip, peer.measurement_port, self.throughput_bytes)
+        sample = PeerMetricsSample(peer.device_id, latency_ms, jitter_ms, loss_pct, throughput, time.time())
+        self._record(sample)
         return sample
 
     def _loop(self) -> None:
