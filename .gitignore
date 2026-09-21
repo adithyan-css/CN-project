@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+received/
+received_a/
+received_b/
+received_c/
+
+demo_file.bin
+*.bin
