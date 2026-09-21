@@ -1,10 +1,16 @@
 """
-Level 5 — Adaptation Engine (the hysteresis controller). HysteresisController
-is pure state: feed it (current_score, best_alternative_score) each tick; it
-tells you whether to switch, requiring N CONSECUTIVE breaches (not one noisy
-sample) to avoid flapping. AdaptationLoop ties MetricsCollector +
-decision.score_peers + HysteresisController + TransferSender together during
-a live transfer and performs the reroute when the controller says to.
+Level 5 — Adaptation Engine (Review 2 redesign).
+
+The agent watches the link to the ONE receiver the user chose. It never
+sends the file to a different device. When that link degrades it pauses
+the transfer (keeping every acknowledged chunk) and, once the link has
+recovered, resumes to the same receiver from the first missing chunk.
+
+LinkWatchdog is pure state (no sockets, no threads) and adds hysteresis in
+both directions: it needs N consecutive unhealthy ticks before pausing and
+M consecutive healthy ticks before resuming, so one noisy sample never
+causes a pause and a link that is flickering never causes rapid
+pause/resume cycling.
 """
 from __future__ import annotations
 
@@ -13,44 +19,61 @@ import threading
 import time
 from typing import Callable, Optional
 
-from .decision import score_peers, TransferProfile
+from .decision import assess_link, LinkHealth
 from .measurement import MetricsCollector
 from .transfer import TransferSender
 
+PAUSE = "PAUSE"
+RESUME = "RESUME"
+
 
 @dataclasses.dataclass
-class HysteresisController:
-    switch_margin: float = 1.3
-    required_consecutive_breaches: int = 3
-    _consecutive_breaches: int = 0
+class LinkWatchdog:
+    pause_after: int = 3     # consecutive unhealthy ticks before pausing
+    resume_after: int = 2    # consecutive healthy ticks before resuming
+    _bad: int = 0
+    _good: int = 0
 
-    def evaluate(self, current_score: float, best_alternative_score: float) -> bool:
-        breached = (current_score <= 0) or (best_alternative_score >= current_score * self.switch_margin)
-        if breached:
-            self._consecutive_breaches += 1
+    def observe(self, healthy: bool, paused: bool) -> Optional[str]:
+        if not paused:
+            self._good = 0
+            self._bad = self._bad + 1 if not healthy else 0
+            if self._bad >= self.pause_after:
+                self.reset()
+                return PAUSE
         else:
-            self._consecutive_breaches = 0
-        return self._consecutive_breaches >= self.required_consecutive_breaches
+            self._bad = 0
+            self._good = self._good + 1 if healthy else 0
+            if self._good >= self.resume_after:
+                self.reset()
+                return RESUME
+        return None
 
     def reset(self) -> None:
-        self._consecutive_breaches = 0
+        self._bad = 0
+        self._good = 0
 
 
 class AdaptationLoop:
     def __init__(self, collector: MetricsCollector, discovery, sender: TransferSender, peer_names: dict,
                  on_event: Optional[Callable[[str], None]] = None, tick_sec: float = 0.5,
-                 profile: TransferProfile = TransferProfile.BALANCED,
-                 controller: Optional[HysteresisController] = None):
+                 watchdog: Optional[LinkWatchdog] = None, clock: Callable[[], float] = time.time):
         self.collector = collector
         self.discovery = discovery
         self.sender = sender
         self.peer_names = peer_names
         self.on_event = on_event or (lambda msg: None)
         self.tick_sec = tick_sec
-        self.profile = profile
-        self.controller = controller or HysteresisController()
+        self.watchdog = watchdog or LinkWatchdog()
+        self.clock = clock
+        self.last_health: Optional[LinkHealth] = None
+        self._pause_requested = False
+        self._announced_drop = False
+        self._waiting_announced = False
+        self._resume_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
 
+    # ---- lifecycle -------------------------------------------------------
     def start(self) -> None:
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -60,39 +83,61 @@ class AdaptationLoop:
     def _loop(self) -> None:
         while not self._stop.is_set():
             time.sleep(self.tick_sec)
-            if self.sender.state.status != "TRANSFERRING":
-                continue
+            status = self.sender.state.status
+            if status == "COMPLETE":
+                st = self.sender.state
+                extra = f" after {st.pauses} pause(s) and {st.resumes} resume(s)" if st.resumes else ""
+                self.on_event(f"Transfer complete: all {st.total_chunks} chunks verified{extra}.")
+                break
+            if status == "FAILED":
+                self.on_event("Transfer failed: the receiver declined the file.")
+                break
             self._tick()
 
+    # ---- one decision step -----------------------------------------------
+    def _name(self, pid: str) -> str:
+        return self.peer_names.get(pid, pid)
+
+    def _progress(self) -> str:
+        st = self.sender.state
+        return f"{st.progress_pct:.0f}% (chunk {self.sender.next_chunk + 1}/{st.total_chunks})"
+
     def _tick(self) -> None:
-        latest = self.collector.all_latest()
-        history = {pid: self.collector.history(pid) for pid in latest}
-        ranked = score_peers(latest, history, profile=self.profile)
-        if not ranked:
+        st = self.sender.state
+        pid = st.peer_id
+        if not pid or st.status in ("IDLE", "COMPLETE", "FAILED"):
             return
+        name = self._name(pid)
+        health = assess_link(self.collector.latest(pid), self.clock())
+        self.last_health = health
 
-        current_peer_id = self.sender.state.peer_id
-        current = next((r for r in ranked if r.peer_id == current_peer_id), None)
-        alternatives = [r for r in ranked if r.peer_id != current_peer_id and not r.excluded]
-        if current is None or not alternatives:
-            return
+        if st.status == "DEGRADED" and not self._announced_drop:
+            self._announced_drop = True
+            self._pause_requested = True
+            self.on_event(f"Connection to {name} dropped at {self._progress()}. "
+                          f"Progress is kept; the agent will resume when the link recovers.")
 
-        best_alt = alternatives[0]
-        if not self.controller.evaluate(current.score, best_alt.score):
-            return
+        resuming = self._resume_thread is not None and self._resume_thread.is_alive()
+        paused = self._pause_requested or st.status in ("PAUSED", "DEGRADED")
+        action = self.watchdog.observe(health.healthy, paused)
 
-        current_name = self.peer_names.get(current_peer_id, current_peer_id)
-        alt_name = self.peer_names.get(best_alt.peer_id, best_alt.peer_id)
-        improvement = (best_alt.score / current.score) if current.score > 0 else float("inf")
-        self.on_event(f"Route degraded (current score {current.score:.2f}). Searching for better transfer option...")
-
-        peer = next((p for p in self.discovery.get_peers() if p.device_id == best_alt.peer_id), None)
-        if peer is None:
-            return
-
-        self.sender.cancel_current()
-        self.controller.reset()
-        self.on_event(f"Switched to {alt_name} — {improvement:.1f}x better than {current_name}")
-
-        threading.Thread(target=self.sender.send_to,
-                          args=(best_alt.peer_id, peer.ip, peer.transfer_port), daemon=True).start()
+        if action == PAUSE and st.status == "TRANSFERRING" and not resuming:
+            self._pause_requested = True
+            self.on_event(f"Link to {name} degraded: {health.reason}. "
+                          f"Pausing at {self._progress()}; progress kept.")
+            self.sender.pause()
+        elif action == RESUME and paused and not resuming:
+            peer = next((p for p in self.discovery.get_peers() if p.device_id == pid), None)
+            if peer is None:
+                if not self._waiting_announced:
+                    self._waiting_announced = True
+                    self.on_event(f"Waiting for {name} to reappear before resuming.")
+                return
+            self._pause_requested = False
+            self._announced_drop = False
+            self._waiting_announced = False
+            self.on_event(f"Link to {name} recovered ({health.reason}). Resuming from "
+                          f"{self._progress()}; only missing chunks are sent.")
+            self._resume_thread = threading.Thread(
+                target=self.sender.send_to, args=(pid, peer.ip, peer.transfer_port), daemon=True)
+            self._resume_thread.start()

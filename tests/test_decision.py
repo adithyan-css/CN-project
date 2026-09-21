@@ -14,7 +14,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pathsense.measurement import PeerMetricsSample
-from pathsense.decision import score_peers, explain, TransferProfile
+from pathsense.decision import score_peers, explain, assess_link, TransferProfile
 
 
 def _sample(peer_id, latency_ms, loss_pct, throughput_mbps):
@@ -86,9 +86,26 @@ def test_explanation_mentions_excluded_peer_reason():
     print("PASS: test_explanation_mentions_excluded_peer_reason")
 
 
+def test_assess_link_single_receiver():
+    now = time.time()
+    good = assess_link(_sample("B", 12, 0, 50), now)
+    assert good.healthy and "latency" in good.reason
+    assert not assess_link(None, now).healthy
+    assert not assess_link(_sample("B", 12, 40, 50), now).healthy                  # heavy loss
+    assert not assess_link(_sample("B", 12, 0, 0.1), now).healthy                  # unusable throughput
+    assert not assess_link(_sample("B", 900, 0, 50), now).healthy                  # huge latency
+    stale = PeerMetricsSample("B", 12, 1.0, 0.0, 50, now - 30)
+    h = assess_link(stale, now)
+    assert not h.healthy and "unreachable" in h.reason
+    dead = PeerMetricsSample("B", None, None, 100.0, None, now)
+    assert not assess_link(dead, now).healthy
+    print("PASS: test_assess_link_single_receiver")
+
+
 if __name__ == "__main__":
     test_does_not_blindly_pick_highest_bandwidth()
     test_high_loss_peer_is_excluded()
     test_low_latency_profile_favors_lower_latency_peer_more_than_balanced()
     test_empty_input_returns_empty()
     test_explanation_mentions_excluded_peer_reason()
+    test_assess_link_single_receiver()

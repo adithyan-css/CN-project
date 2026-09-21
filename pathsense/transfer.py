@@ -1,14 +1,13 @@
 """
 Level 4 — Transfer Engine.
-Chunked, checksummed, stop-and-wait TCP file transfer. RESUME (same
-peer_id reconnecting) preserves acked_chunks and only (re-)sends what's
-missing. REROUTE (different peer_id) resets acked_chunks and resends the
-whole file, because the new peer has zero bytes of it — there is no such
-thing as a byte-offset resume onto a machine that never received anything
-(see TRD §8.1). An earlier version tried to send only "remaining" chunks
-to the new peer on reroute, which produced a truncated/zero-padded file;
-that bug is what test_reroute_to_different_peer_sends_full_file_not_partial
-guards against.
+Chunked, checksummed, stop-and-wait TCP file transfer.
+
+Review 2 change: a TransferSender is bound to ONE receiver for its whole
+life. Adaptation no longer "reroutes" a file to a different device (that
+would deliver the file to the wrong person). Instead, when the link to the
+chosen receiver degrades, the transfer is PAUSED and later RESUMED to the
+same receiver: acked_chunks is preserved and only the missing chunks are
+sent (checkpoint resume).
 """
 from __future__ import annotations
 
@@ -32,8 +31,10 @@ class TransferState:
     total_chunks: int
     acked_chunks: set
     peer_id: str
-    status: str = "IDLE"
+    status: str = "IDLE"   # IDLE | TRANSFERRING | PAUSED | DEGRADED | COMPLETE | FAILED
     started_at: float = 0.0
+    pauses: int = 0
+    resumes: int = 0
     bytes_per_sec_ema: float = 0.0
 
     @property
@@ -80,6 +81,9 @@ class TransferReceiver:
                 continue
             except OSError:
                 break
+            # Stop-and-wait (header, payload, then wait for ACK) + Nagle +
+            # delayed ACKs stalls ~40 ms per chunk; disable Nagle.
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             threading.Thread(target=self._handle_session, args=(conn,), daemon=True).start()
 
     def _handle_session(self, conn: socket.socket) -> None:
@@ -137,13 +141,8 @@ class TransferSender:
         )
         self._cancel_current = threading.Event()
         self._lock = threading.Lock()
-        # Serializes whole send_to() calls: without this, a reroute that
-        # starts a new send_to() thread before the just-cancelled old one
-        # has actually exited its loop can race on self.state.acked_chunks
-        # (the old thread re-reads self.state.acked_chunks fresh on every
-        # access, so it can end up adding indices to the NEW peer's just
-        # -reset set after only ever talking to the OLD peer's socket,
-        # marking chunks "acked" that the new peer never received).
+        # Serializes whole send_to() calls so a resume never overlaps a
+        # session that is still winding down after a pause.
         self._session_lock = threading.Lock()
 
     def _emit(self):
@@ -157,7 +156,11 @@ class TransferSender:
     def _send_to_locked(self, peer_id: str, ip: str, port: int) -> bool:
         with self._lock:
             if self.state.peer_id and self.state.peer_id != peer_id:
-                self.state.acked_chunks = set()   # new peer has zero bytes -> resend all
+                raise ValueError(
+                    f"transfer is bound to receiver {self.state.peer_id!r}; "
+                    f"refusing to send it to a different device ({peer_id!r})")
+            if self.state.status in ("PAUSED", "DEGRADED"):
+                self.state.resumes += 1
             self.state.peer_id = peer_id
             self.state.status = "TRANSFERRING"
             if self.state.started_at == 0.0:
@@ -168,6 +171,7 @@ class TransferSender:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             s.settimeout(5.0)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             s.connect((ip, port))
             protocol.send_json(s, {
                 "type": "OFFER", "file_id": self.state.file_id,
@@ -186,6 +190,8 @@ class TransferSender:
                     if idx in self.state.acked_chunks:
                         continue
                     if self._cancel_current.is_set():
+                        self.state.status = "PAUSED"
+                        self._emit()
                         return False
                     f.seek(idx * self.chunk_size)
                     raw = f.read(self.chunk_size)
@@ -199,9 +205,12 @@ class TransferSender:
                         self._emit()
 
             protocol.send_json(s, {"type": "COMPLETE"})
-            self.state.status = "COMPLETE"
+            done = len(self.state.acked_chunks) == self.state.total_chunks
+            # A chunk that failed its checksum is not acked; leave the transfer
+            # resumable instead of claiming it completed.
+            self.state.status = "COMPLETE" if done else "DEGRADED"
             self._emit()
-            return len(self.state.acked_chunks) == self.state.total_chunks
+            return done
         except (OSError, ConnectionError):
             self.state.status = "DEGRADED"
             self._emit()
@@ -211,3 +220,16 @@ class TransferSender:
 
     def cancel_current(self) -> None:
         self._cancel_current.set()
+
+    def pause(self) -> None:
+        """Stop after the current chunk; progress (acked_chunks) is kept."""
+        with self._lock:
+            self.state.pauses += 1
+        self._cancel_current.set()
+
+    @property
+    def next_chunk(self) -> int:
+        for idx in range(self.state.total_chunks):
+            if idx not in self.state.acked_chunks:
+                return idx
+        return self.state.total_chunks

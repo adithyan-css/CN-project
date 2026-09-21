@@ -124,3 +124,43 @@ def explain(ranked: list[ScoredPeer], peer_names: dict[str, str]) -> str:
         name = peer_names.get(r.peer_id, r.peer_id)
         lines.append(f"Not selected — {name}: {r.exclude_reason}")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Single-link health (Review 2): the adaptation engine now watches ONE link —
+# the one to the receiver the user chose — instead of comparing it against
+# other devices. score_peers() normalises peers against each other, which is
+# meaningless for a single link, so health uses absolute thresholds instead.
+# ---------------------------------------------------------------------------
+MAX_HEALTHY_LATENCY_MS = 300.0
+MAX_SAMPLE_AGE_SEC = 8.0
+
+
+@dataclasses.dataclass
+class LinkHealth:
+    healthy: bool
+    reason: str
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+def assess_link(sample: Optional[PeerMetricsSample], now: float,
+                max_sample_age_sec: float = MAX_SAMPLE_AGE_SEC) -> LinkHealth:
+    """Plain-language verdict on whether the link to one receiver is usable."""
+    if sample is None:
+        return LinkHealth(False, "no measurements for this receiver yet")
+    age = now - sample.measured_at
+    if age > max_sample_age_sec:
+        return LinkHealth(False, f"no fresh measurement for {age:.0f}s (receiver unreachable)")
+    if sample.latency_ms is None:
+        return LinkHealth(False, "receiver is not answering probes (100% loss)")
+    if sample.loss_pct > MAX_ACCEPTABLE_LOSS_PCT:
+        return LinkHealth(False, f"packet loss {sample.loss_pct:.0f}% exceeds {MAX_ACCEPTABLE_LOSS_PCT:.0f}%")
+    if sample.throughput_mbps is None or sample.throughput_mbps < MIN_ACCEPTABLE_THROUGHPUT_MBPS:
+        tp = "none" if sample.throughput_mbps is None else f"{sample.throughput_mbps:.2f} Mbps"
+        return LinkHealth(False, f"throughput {tp} is below the usable minimum")
+    if sample.latency_ms > MAX_HEALTHY_LATENCY_MS:
+        return LinkHealth(False, f"latency {sample.latency_ms:.0f} ms exceeds {MAX_HEALTHY_LATENCY_MS:.0f} ms")
+    return LinkHealth(True, f"latency {sample.latency_ms:.1f} ms, loss {sample.loss_pct:.0f}%, "
+                            f"throughput {sample.throughput_mbps:.1f} Mbps")

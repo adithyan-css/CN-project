@@ -2,9 +2,9 @@
 Level 4 test — Transfer Engine.
 Proves: (1) a full file arrives checksum-identical (FR-11); (2) an
 interrupted transfer reconnecting to the SAME peer resumes from the last
-acknowledged chunk rather than resending it (FR-12, AC-3); (3) a transfer
-rerouted to a DIFFERENT peer produces a full, checksum-correct file, not a
-truncated/zero-padded one (FR-13, AC-4, TRD §8.1's documented rule).
+acknowledged chunk rather than resending it (FR-12, AC-3); (3) Review 2:
+a sender is bound to one receiver and refuses to send the file to a
+different device; pause() stops cleanly with status PAUSED and progress kept.
 Real sockets, real files, real threads — nothing mocked.
 """
 import hashlib
@@ -113,47 +113,60 @@ def test_resume_same_peer_after_interruption():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_reroute_to_different_peer_sends_full_file_not_partial():
-    tmp = tempfile.mkdtemp(prefix="ps_reroute_")
+def test_sender_refuses_a_different_receiver():
+    tmp = tempfile.mkdtemp(prefix="ps_bound_")
     try:
-        recv_dir_b = os.path.join(tmp, "recv_b")
-        recv_dir_c = os.path.join(tmp, "recv_c")
-        chunk_size = 4096
-        total_chunks = 6
-        src = _make_source_file(tmp, "reroute.bin", total_chunks=total_chunks, chunk_size=chunk_size)
+        src = _make_source_file(tmp, "bound.bin", total_chunks=4, chunk_size=4096)
+        receiver = TransferReceiver(53103, os.path.join(tmp, "recv_b"))
+        receiver.start()
+        time.sleep(0.3)
+        try:
+            sender = TransferSender(src, chunk_size=4096)
+            assert sender.send_to("peer-B", HOST, 53103) is True
+            try:
+                sender.send_to("peer-C", HOST, 53104)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("sender must refuse to send a transfer to a different receiver")
+            assert sender.state.peer_id == "peer-B"
+            print("PASS: test_sender_refuses_a_different_receiver")
+        finally:
+            receiver.stop()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
-        receiver_b = TransferReceiver(53103, recv_dir_b)
-        receiver_c = TransferReceiver(53104, recv_dir_c)
-        receiver_b.start()
-        receiver_c.start()
+
+def test_pause_keeps_progress_and_resume_completes():
+    tmp = tempfile.mkdtemp(prefix="ps_pause_")
+    try:
+        recv_dir = os.path.join(tmp, "recv_b")
+        chunk_size, total_chunks = 4096, 10
+        src = _make_source_file(tmp, "pause.bin", total_chunks=total_chunks, chunk_size=chunk_size)
+        receiver = TransferReceiver(53105, recv_dir)
+        receiver.start()
         time.sleep(0.3)
         try:
             sender = TransferSender(src, chunk_size=chunk_size)
 
             def on_change(state):
-                if len(state.acked_chunks) >= 3:
-                    sender.cancel_current()
+                if len(state.acked_chunks) >= 4 and state.pauses == 0:
+                    sender.pause()
 
             sender.on_state_change = on_change
-            interrupted_result = sender.send_to("peer-B", HOST, 53103)
-            assert interrupted_result is False
-            assert len(sender.state.acked_chunks) >= 3
+            assert sender.send_to("peer-B", HOST, 53105) is False
+            assert sender.state.status == "PAUSED"
+            kept = len(sender.state.acked_chunks)
+            assert kept >= 4 and sender.state.pauses == 1
+            assert sender.next_chunk == kept
 
             sender.on_state_change = None
-            rerouted_result = sender.send_to("peer-C", HOST, 53104)  # DIFFERENT peer_id -> full resend
-            assert rerouted_result is True, "reroute to a different peer did not complete"
-            assert sender.state.acked_chunks == set(range(total_chunks)), (
-                "reroute must send every chunk to the new peer, not just the 'remaining' ones"
-            )
-
-            dest_c = os.path.join(recv_dir_c, "reroute.bin")
-            assert os.path.exists(dest_c)
-            assert os.path.getsize(dest_c) == os.path.getsize(src), "rerouted file on new peer is truncated"
-            assert _sha256_file(dest_c) == _sha256_file(src), "rerouted file on new peer is corrupted/partial"
-            print("PASS: test_reroute_to_different_peer_sends_full_file_not_partial")
+            assert sender.send_to("peer-B", HOST, 53105) is True
+            assert sender.state.resumes == 1 and sender.state.status == "COMPLETE"
+            assert _sha256_file(os.path.join(recv_dir, "pause.bin")) == _sha256_file(src)
+            print("PASS: test_pause_keeps_progress_and_resume_completes")
         finally:
-            receiver_b.stop()
-            receiver_c.stop()
+            receiver.stop()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -161,4 +174,5 @@ def test_reroute_to_different_peer_sends_full_file_not_partial():
 if __name__ == "__main__":
     test_full_transfer_checksum_matches()
     test_resume_same_peer_after_interruption()
-    test_reroute_to_different_peer_sends_full_file_not_partial()
+    test_sender_refuses_a_different_receiver()
+    test_pause_keeps_progress_and_resume_completes()
