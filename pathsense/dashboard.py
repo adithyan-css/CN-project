@@ -197,7 +197,8 @@ body{margin:0;background:var(--parchment);color:var(--ink);font-family:var(--fon
 .status-pill.COMPLETE{color:var(--status-good);background:rgba(29,154,108,0.08)}
 .status-pill.DEGRADED,.status-pill.FAILED{color:var(--status-bad);background:rgba(217,45,32,0.08)}
 .status-pill.IDLE{color:var(--ink-muted-48);background:var(--divider-soft)}
-.status-pill.PAUSED{color:#b25e00;background:rgba(230,126,0,0.10)}
+.status-pill.PAUSED,.status-pill.INTERRUPTED{color:#b25e00;background:rgba(230,126,0,0.10)}
+.status-pill.RECEIVING{color:var(--primary);background:rgba(0,102,204,0.08)}
 .health{font-size:13px;letter-spacing:-0.2px;margin-top:10px;color:var(--ink-muted-80)}
 .health.good b{color:var(--status-good)}
 .health.bad b{color:var(--status-bad)}
@@ -261,6 +262,11 @@ body{margin:0;background:var(--parchment);color:var(--ink);font-family:var(--fon
   <section class="card">
     <h2 class="card-title">Current Transfer</h2>
     <div id="transferBody"><div class="transfer-idle">No active transfer</div></div>
+  </section>
+
+  <section class="card">
+    <h2 class="card-title">Incoming Transfer</h2>
+    <div id="incomingBody"><div class="transfer-idle">Nothing being received</div></div>
   </section>
 
   <section class="card card-dark">
@@ -363,6 +369,24 @@ async function tick(){
         <div class="t-row"><span>Pauses: ${t.pauses} · Resumes: ${t.resumes}</span><span></span></div>
         ${healthHtml}
         ${active ? `<div class="t-actions"><button type="button" class="btn-secondary" onclick="simulate()">Simulate link degradation (8 s)</button>${sim}</div>` : ''}
+      </div>`;
+  }
+
+  const inc = s.incoming;
+  const incBody = document.querySelector('#incomingBody');
+  if (!inc) {
+    incBody.innerHTML = '<div class="transfer-idle">Nothing being received</div>';
+  } else {
+    const note = inc.status === 'INTERRUPTED' ? 'Link dropped. Chunks already received are kept; waiting for the sender to resume.'
+               : inc.status === 'COMPLETE' ? 'Saved to ' + inc.dest_path : 'Every chunk is checked with SHA-256 before it is written.';
+    incBody.innerHTML = `
+      <div class="transfer-active">
+        <div class="t-name">${escapeHtml(inc.name)} ← ${escapeHtml(inc.sender)}</div>
+        <div class="progress-track"><div class="progress-fill" style="width:${inc.progress_pct}%"></div></div>
+        <div class="t-row"><span>${inc.received} / ${inc.total_chunks} chunks (${inc.progress_pct}%) · ${(inc.size/1048576).toFixed(1)} MB</span>
+          <span class="status-pill ${inc.status}">${inc.status}</span></div>
+        <div class="t-row"><span>Connections: ${inc.sessions}</span><span></span></div>
+        <div class="health">${escapeHtml(note)}</div>
       </div>`;
   }
 

@@ -54,13 +54,53 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+@dataclasses.dataclass
+class IncomingTransfer:
+    """Receiver-side view of one file being received (survives pause/resume,
+    because the sender keeps the same file_id when it resumes)."""
+    file_id: str
+    name: str
+    size: int
+    total_chunks: int
+    sender: str
+    dest_path: str
+    received: set = dataclasses.field(default_factory=set)
+    status: str = "RECEIVING"   # RECEIVING | INTERRUPTED | COMPLETE
+    sessions: int = 0
+    started_at: float = 0.0
+    updated_at: float = 0.0
+
+    @property
+    def progress_pct(self) -> float:
+        return 100.0 if self.total_chunks == 0 else 100.0 * len(self.received) / self.total_chunks
+
+    def to_dict(self) -> dict:
+        # Built by hand (not dataclasses.asdict) so the dashboard thread never
+        # iterates `received` while the session thread is adding to it.
+        return {"file_id": self.file_id, "name": self.name, "size": self.size,
+                "total_chunks": self.total_chunks, "sender": self.sender,
+                "dest_path": self.dest_path, "received": len(self.received),
+                "status": self.status, "sessions": self.sessions,
+                "progress_pct": round(self.progress_pct, 1)}
+
+
 class TransferReceiver:
-    def __init__(self, port: int, save_dir: str, auto_accept: bool = True):
+    def __init__(self, port: int, save_dir: str, auto_accept: bool = True,
+                 on_event: Optional[Callable[[str], None]] = None):
         self.port = port
         self.save_dir = save_dir
         self.auto_accept = auto_accept
+        self.on_event = on_event or (lambda msg: None)
         os.makedirs(save_dir, exist_ok=True)
         self._stop = threading.Event()
+        self._incoming: dict[str, IncomingTransfer] = {}
+        self._inc_lock = threading.Lock()
+        self.latest_file_id: Optional[str] = None
+
+    def incoming(self) -> Optional[IncomingTransfer]:
+        """The most recent incoming transfer (for the dashboard)."""
+        with self._inc_lock:
+            return self._incoming.get(self.latest_file_id) if self.latest_file_id else None
 
     def start(self) -> None:
         threading.Thread(target=self._accept_loop, daemon=True).start()
@@ -84,9 +124,10 @@ class TransferReceiver:
             # Stop-and-wait (header, payload, then wait for ACK) + Nagle +
             # delayed ACKs stalls ~40 ms per chunk; disable Nagle.
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            threading.Thread(target=self._handle_session, args=(conn,), daemon=True).start()
+            threading.Thread(target=self._handle_session, args=(conn, addr), daemon=True).start()
 
-    def _handle_session(self, conn: socket.socket) -> None:
+    def _handle_session(self, conn: socket.socket, addr=None) -> None:
+        inc: Optional[IncomingTransfer] = None
         try:
             offer = protocol.recv_json(conn)
             if offer.get("type") != "OFFER":
@@ -96,7 +137,26 @@ class TransferReceiver:
                 return
             protocol.send_json(conn, {"type": "ACCEPT", "file_id": offer["file_id"]})
 
-            dest_path = os.path.join(self.save_dir, offer["name"])
+            dest_path = os.path.join(self.save_dir, os.path.basename(offer["name"]))
+            sender = offer.get("sender_name") or (addr[0] if addr else "unknown sender")
+            now = time.time()
+            with self._inc_lock:
+                inc = self._incoming.get(offer["file_id"])
+                resumed = inc is not None
+                if inc is None:
+                    inc = IncomingTransfer(offer["file_id"], offer["name"], offer["size"],
+                                           offer["total_chunks"], sender, dest_path, started_at=now)
+                    self._incoming[offer["file_id"]] = inc
+                inc.status = "RECEIVING"
+                inc.sessions += 1
+                inc.updated_at = now
+                self.latest_file_id = offer["file_id"]
+            mb = offer["size"] / (1024 * 1024)
+            if resumed:
+                self.on_event(f"{sender} resumed sending {offer['name']} from {inc.progress_pct:.0f}% "
+                              f"({len(inc.received)}/{inc.total_chunks} chunks already here)")
+            else:
+                self.on_event(f"Receiving {offer['name']} ({mb:.1f} MB) from {sender}")
             # Only truncate/preallocate for a FRESH transfer (different
             # file, or first time we've seen this name+size). A RESUME
             # (same name+size already on disk) must NOT truncate.
@@ -110,6 +170,10 @@ class TransferReceiver:
             while True:
                 header = protocol.recv_json(conn)
                 if header["type"] == "COMPLETE":
+                    if len(inc.received) == inc.total_chunks:
+                        inc.status = "COMPLETE"
+                        self.on_event(f"Received {offer['name']} from {sender}: all {inc.total_chunks} chunks "
+                                      f"verified (SHA-256). Saved to {dest_path}")
                     break
                 if header["type"] != "CHUNK":
                     continue
@@ -119,17 +183,25 @@ class TransferReceiver:
                     with open(dest_path, "r+b") as f:
                         f.seek(header["chunk_index"] * offer["chunk_size"])
                         f.write(raw)
+                    inc.received.add(header["chunk_index"])
+                    inc.updated_at = time.time()
                 protocol.send_json(conn, {"type": "CHUNK_ACK", "chunk_index": header["chunk_index"], "ok": ok})
         except (ConnectionError, OSError, KeyError):
             pass
         finally:
             conn.close()
+            if inc is not None and inc.status == "RECEIVING":
+                inc.status = "INTERRUPTED"
+                self.on_event(f"Connection from {inc.sender} interrupted at {inc.progress_pct:.0f}% "
+                              f"({len(inc.received)}/{inc.total_chunks} chunks kept); waiting for resume")
 
 
 class TransferSender:
     def __init__(self, file_path: str, chunk_size: int = protocol.CHUNK_SIZE_DEFAULT,
-                 on_state_change: Optional[Callable[[TransferState], None]] = None):
+                 on_state_change: Optional[Callable[[TransferState], None]] = None,
+                 sender_name: str = ""):
         self.file_path = file_path
+        self.sender_name = sender_name
         self.chunk_size = chunk_size
         self.on_state_change = on_state_change
         size = os.path.getsize(file_path)
@@ -177,7 +249,7 @@ class TransferSender:
                 "type": "OFFER", "file_id": self.state.file_id,
                 "name": os.path.basename(self.file_path), "size": self.state.file_size,
                 "chunk_size": self.chunk_size, "total_chunks": self.state.total_chunks,
-                "checksum_algo": "sha256",
+                "checksum_algo": "sha256", "sender_name": self.sender_name,
             })
             reply = protocol.recv_json(s)
             if reply.get("type") != "ACCEPT":
