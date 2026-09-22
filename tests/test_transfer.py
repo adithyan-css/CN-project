@@ -164,6 +164,10 @@ def test_pause_keeps_progress_and_resume_completes():
             assert sender.send_to("peer-B", HOST, 53105) is True
             assert sender.state.resumes == 1 and sender.state.status == "COMPLETE"
             assert _sha256_file(os.path.join(recv_dir, "pause.bin")) == _sha256_file(src)
+            time.sleep(0.2)
+            inc = receiver.incoming()
+            assert inc is not None and inc.status == "COMPLETE", "receiver must report the incoming file"
+            assert inc.received == set(range(total_chunks)) and inc.sessions == 2
             print("PASS: test_pause_keeps_progress_and_resume_completes")
         finally:
             receiver.stop()

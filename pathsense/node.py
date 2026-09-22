@@ -32,7 +32,7 @@ class Node:
         self.discovery = Discovery(self.device_id, name, measurement_port, transfer_port)
         self.measurement_server = MeasurementServer(measurement_port)
         self.collector = MetricsCollector(self.discovery)
-        self.receiver = TransferReceiver(transfer_port, save_dir)
+        self.receiver = TransferReceiver(transfer_port, save_dir, on_event=self.log)
         self.dashboard_port = dashboard_port
         # Root for the dashboard's file browser. Clamped so the (unauthenticated,
         # LAN-reachable) /api/browse endpoint can't be walked outside the user's
@@ -68,6 +68,7 @@ class Node:
             "metrics": {pid: m.to_dict() for pid, m in latest.items()},
             "scores": {r.peer_id: r.to_dict() for r in ranked},
             "transfer": self._transfer_state(),
+            "incoming": self.receiver.incoming().to_dict() if self.receiver.incoming() else None,
             "events": list(self.events),
         }
 
@@ -106,7 +107,7 @@ class Node:
         if self.current_loop:
             self.current_loop.stop()
         names = self._peer_names()
-        self.current_sender = TransferSender(file_path, on_state_change=lambda st: None)
+        self.current_sender = TransferSender(file_path, on_state_change=lambda st: None, sender_name=self.name)
         self.current_loop = AdaptationLoop(self.collector, self.discovery, self.current_sender,
                                             names, on_event=self.log)
 
