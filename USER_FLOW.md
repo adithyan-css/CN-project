@@ -69,26 +69,30 @@ On the dashboard:
 2. Type the **full file path** of a file that exists on that specific laptop (e.g., `/home/you/demo_video.mp4` on Mac/Linux, or `C:\Users\you\demo_video.mp4` on Windows).
 3. Click **Send**.
 
-The "Current Transfer" panel shows live progress, and the "Adaptation Events" log shows the system's own running commentary — including the peer-selection explanation the moment the transfer starts.
+The "Current Transfer" panel shows live progress, the receiver's link health in plain words, and the pause/resume counters. The "Agent Decisions" log shows the system's own running commentary, starting with the link check for the receiver you picked.
 
-## Step 5 — The live "wow" moment (do this on purpose, don't wait for it to happen naturally)
+Use a big file (1 GB or more) so the transfer lasts long enough to demo.
 
-While a transfer is running, deliberately make the chosen laptop's connection worse — either:
-- physically move that laptop farther from the hotspot laptop (weakens real Wi-Fi signal), or
-- (if you built the optional throttle script from BUILD_GUIDE.md's "what's left" section) trigger it on that laptop.
+## Step 5 — The live "wow" moment: pause and resume on the same receiver
 
-Watch the dashboard: the degrading laptop's latency/loss numbers will visibly worsen, and — after a few seconds of sustained bad readings (this delay is intentional, so one blip doesn't cause a switch) — the Adaptation Events log will show something like:
+While a transfer is running, make the receiver's link bad in one of two ways:
+
+- **Real (best):** turn off Wi-Fi on the receiving laptop for about 10 seconds, then turn it back on. You can also walk it far from the hotspot.
+- **Simulated (backup, if the room's network is too good to degrade):** click **Simulate link degradation (8 s)** in the Current Transfer panel. It injects clearly labelled fake bad measurements ("simulated" tag) for 8 seconds. The pause and resume that follow are real.
+
+After a few consecutive bad readings (the delay is deliberate, so one blip never pauses a transfer), the log shows something like:
 
 ```
-14:32:07 — Route degraded (current score 0.31). Searching for better transfer option...
-14:32:08 — Switched to Laptop C — 2.1x better than Laptop B
+12:49:52 — Link to Laptop B degraded: packet loss 40% exceeds 15%. Pausing at 41% (chunk 7809/19200); progress kept.
+12:49:59 — Link to Laptop B recovered (latency 0.9 ms, loss 0%, throughput 48.2 Mbps). Resuming from 41% (chunk 7810/19200); only missing chunks are sent.
+12:50:03 — Transfer complete: all 19200 chunks verified after 1 pause(s) and 1 resume(s).
 ```
 
-The transfer keeps going, now via Laptop C, and completes successfully.
+The file always stays with the receiver you chose. It never gets sent to a different device.
 
 ## What this demonstrates, in one sentence for judges
 
-"Every other nearby file-sharing app would just get slower right now and tell you nothing — ours notices, explains why, and fixes itself automatically while the transfer is still running."
+"Other nearby file-sharing apps just stall or fail and tell you nothing. Ours notices the link degrading, says why, pauses without losing progress, and resumes from where it stopped once the link recovers."
 
 ## Troubleshooting (things that can genuinely go wrong, and what they mean)
 
@@ -97,11 +101,13 @@ The transfer keeps going, now via Laptop C, and completes successfully.
 | A laptop never appears in "Nearby Devices" | It's not on the same network, or that network blocks multicast discovery | Re-check Step 1; switch everyone to the same laptop's hotspot |
 | A peer appears but its latency/loss/throughput stay blank ("-") | Discovery worked but active measurement hasn't completed a round yet | Wait a few more seconds — measurement runs on its own interval |
 | "Send failed: peer ... not currently discovered" | The peer's entry expired (it went offline, or the network dropped) right before you clicked Send | Make sure the target laptop's `pathsense.node` process is still running, then try again |
-| The reroute never triggers even though you degraded the connection | The degradation wasn't sustained long enough, or wasn't severe enough to cross the switch threshold | Make the change more drastic (move farther, or degrade for longer) — the system requires several consecutive bad readings on purpose, so one brief dip won't trigger it |
+| The transfer never pauses even though you degraded the connection | The degradation wasn't sustained or severe enough (the thresholds are over 15% loss, over 300 ms latency, under 0.5 Mbps, or no fresh measurement for 8 s) | Turn Wi-Fi off for longer, or use **Simulate link degradation**. Several consecutive bad readings are required on purpose |
+| The transfer finishes before you can degrade it | The file is too small for your network's speed | Use a bigger file (1–2 GB) |
 | You want to rehearse without 3 physical laptops | You can run all 3 `pathsense.node` processes on one machine using different `--measurement-port`/`--transfer-port`/`--dashboard-port` values for each (see BUILD_GUIDE.md's test files for exactly this pattern) | Use different port numbers per instance, e.g. `--dashboard-port 8801`, `8802`, `8803` |
 
 ## What NOT to promise judges (matches TRD.md §12/§14 — stay honest here)
 
 - The transfer channel in this MVP is **not encrypted** — say so if asked; it's a documented, deliberate scope decision (Phase 2 item), not a hidden gap.
-- Rerouting to a **different** peer restarts that peer's copy of the file from the beginning (it can't "resume" data another device already received) — the win is switching away from a bad path quickly, not magic teleportation of already-sent bytes. Resuming from a checkpoint only applies when reconnecting to the **same** peer after a drop.
+- The agent does **not** switch the file to another device. It pauses and resumes on the receiver you chose (Review 2 design change). Picking a better path to the same receiver (Wi-Fi Direct or Bluetooth fallback) and the AI prediction and tuning are Review 3 work.
+- **Simulate link degradation** fakes the *measurements* only, and the dashboard labels it as simulated. Say so if you use it.
 - This runs over your own local Wi-Fi/hotspot — it does not require the internet, but it also isn't built to work across two networks that aren't sharing one hotspot/router (that's a named Phase 2 item, not a bug).
