@@ -7,7 +7,7 @@ output" block under each level is the real console output from running
 that level's test file, not a mockup. Nothing here is guessed.
 
 Follow the levels in order — each one depends on the previous. If you're
-using an AI coding assistant in VS Code (Copilot, Claude, etc.), give it
+using an AI coding assistant in VS Code, give it
 one level at a time and have it run the test file before moving to the
 next level, exactly as this guide did.
 

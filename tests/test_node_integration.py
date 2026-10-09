@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 
@@ -35,6 +36,27 @@ def _get_state(dashboard_port: int) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _post(dashboard_port: int, path: str, body: dict) -> dict:
+    req = urllib.request.Request(
+        f"http://{HOST}:{dashboard_port}{path}", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _confirm_pairing_when_asked(dashboard_port: int, deadline_sec: float = 20.0) -> bool:
+    """Acts as the receiving user: wait for the 6-digit code, then confirm it."""
+    deadline = time.time() + deadline_sec
+    while time.time() < deadline:
+        pending = _get_state(dashboard_port).get("pending_pair")
+        if pending:
+            assert len(pending["code"]) == 6 and pending["code"].isdigit()
+            _post(dashboard_port, "/api/pair", {"peer_id": pending["peer_id"], "accepted": True})
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def _post_send(dashboard_port: int, peer_id: str, file_path: str) -> dict:
     body = json.dumps({"peer_id": peer_id, "file_path": file_path}).encode("utf-8")
     req = urllib.request.Request(
@@ -53,10 +75,13 @@ def test_two_nodes_discover_and_transfer_via_http_api():
         with open(src_path, "wb") as f:
             f.write(os.urandom(300_000))
 
+        state_dir = os.path.join(tmp, "state")
         node_a = Node("Node A", measurement_port=53301, transfer_port=53302,
-                       dashboard_port=53380, save_dir=save_dir_a)
+                       dashboard_port=53380, save_dir=save_dir_a,
+                       discovery_mode="multicast", state_dir=os.path.join(state_dir, "a"))
         node_b = Node("Node B", measurement_port=53303, transfer_port=53304,
-                       dashboard_port=53381, save_dir=save_dir_b)
+                       dashboard_port=53381, save_dir=save_dir_b,
+                       discovery_mode="multicast", state_dir=os.path.join(state_dir, "b"))
         node_a.start()
         node_b.start()
         try:
@@ -81,6 +106,10 @@ def test_two_nodes_discover_and_transfer_via_http_api():
             result = _post_send(53380, b_id, src_path)
             assert "file_id" in result, f"send did not start: {result}"
 
+            # Node B's user sees a 6-digit code and confirms it (Review 3 pairing).
+            paired = threading.Thread(target=_confirm_pairing_when_asked, args=(53381,))
+            paired.start()
+
             deadline = time.time() + 20.0
             transfer = None
             while time.time() < deadline:
@@ -89,7 +118,12 @@ def test_two_nodes_discover_and_transfer_via_http_api():
                 if transfer and transfer.get("status") == "COMPLETE":
                     break
                 time.sleep(0.3)
+            paired.join(timeout=1)
             assert transfer is not None and transfer.get("status") == "COMPLETE", f"transfer never completed: {transfer}"
+            assert transfer.get("encrypted") is True, "the transfer was not encrypted after pairing"
+            assert len(transfer.get("pair_code", "")) == 6, "no pairing code recorded"
+            incoming = _get_state(53381).get("incoming")
+            assert incoming and incoming["status"] == "COMPLETE" and incoming["encrypted"], incoming
 
             dest = os.path.join(save_dir_b, "shared.bin")
             assert os.path.exists(dest), "receiving node never wrote the file"

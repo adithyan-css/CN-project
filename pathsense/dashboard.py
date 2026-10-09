@@ -14,10 +14,14 @@ from urllib.parse import urlparse, parse_qs
 def make_dashboard_server(port: int, state_provider: Callable[[], dict],
                            send_handler: Callable[[dict], dict], html_page: str,
                            browse_handler: Optional[Callable[[Optional[str]], dict]] = None,
-                           simulate_handler: Optional[Callable[[dict], dict]] = None) -> ThreadingHTTPServer:
+                           simulate_handler: Optional[Callable[[dict], dict]] = None,
+                           pair_handler: Optional[Callable[[dict], dict]] = None,
+                           ask_handler: Optional[Callable[[dict], dict]] = None) -> ThreadingHTTPServer:
     post_routes = {"/api/send": send_handler}
-    if simulate_handler is not None:
-        post_routes["/api/simulate"] = simulate_handler
+    for path, handler in (("/api/simulate", simulate_handler), ("/api/pair", pair_handler),
+                          ("/api/ask", ask_handler)):
+        if handler is not None:
+            post_routes[path] = handler
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -206,6 +210,38 @@ body{margin:0;background:var(--parchment);color:var(--ink);font-family:var(--fon
 .t-actions .btn-secondary{font-size:13px;padding:6px 14px}
 .tag-sim{display:inline-block;margin-left:8px;font-size:11px;font-weight:600;color:#b25e00;
   background:rgba(230,126,0,0.10);border-radius:9999px;padding:2px 8px;vertical-align:middle}
+.tag-lock{display:inline-block;margin-left:8px;font-size:11px;font-weight:600;color:var(--status-good);
+  background:rgba(29,154,108,0.10);border-radius:9999px;padding:2px 8px;vertical-align:middle}
+.tag-open{display:inline-block;margin-left:8px;font-size:11px;font-weight:600;color:var(--status-bad);
+  background:rgba(217,45,32,0.10);border-radius:9999px;padding:2px 8px;vertical-align:middle}
+.caps{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}
+.cap{font-size:12px;color:var(--ink-muted-80);background:var(--parchment);border-radius:9999px;
+  padding:4px 11px;letter-spacing:-0.12px}
+.pair-card{border:2px solid var(--primary);border-radius:14px;padding:18px 20px;margin-bottom:16px;
+  background:rgba(0,102,204,0.04)}
+.pair-code{font-family:var(--font-mono);font-size:40px;font-weight:700;letter-spacing:10px;
+  color:var(--ink);margin:10px 0}
+.pair-actions{display:flex;gap:10px;margin-top:10px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+@media (max-width:640px){.grid2{grid-template-columns:1fr}}
+.stat{background:var(--parchment);border-radius:12px;padding:12px 14px}
+.stat .k{font-size:12px;color:var(--ink-muted-48);letter-spacing:-0.12px}
+.stat .v{font-size:19px;font-weight:600;letter-spacing:-0.3px;margin-top:2px}
+.risk-track{height:6px;border-radius:9999px;background:var(--divider-soft);overflow:hidden;margin-top:8px}
+.risk-fill{height:100%;background:var(--status-good);border-radius:9999px;transition:width .3s}
+.risk-fill.warn{background:#e67e00}
+.risk-fill.bad{background:var(--status-bad)}
+.ask-row{display:flex;gap:10px;margin-top:4px;flex-wrap:wrap}
+.ask-row .input{flex:1;min-width:200px}
+.answer{margin-top:12px;font-size:14px;line-height:1.5;color:var(--ink);background:var(--parchment);
+  border-radius:12px;padding:12px 14px;white-space:pre-wrap}
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.chip{font-size:12px;border:1px solid var(--hairline);border-radius:9999px;padding:5px 11px;
+  cursor:pointer;background:#fff;color:var(--ink-muted-80)}
+.chip:hover{border-color:var(--primary);color:var(--primary)}
+.arm-row{display:flex;justify-content:space-between;font-size:13px;padding:5px 0;
+  border-bottom:1px solid var(--divider-soft)}
+.arm-row:last-child{border-bottom:none}
 
 .events-log{font-family:var(--font-mono);font-size:12px;line-height:1.6;color:var(--body-muted);
   white-space:pre-wrap;height:180px;overflow-y:auto;letter-spacing:0}
@@ -237,7 +273,8 @@ body{margin:0;background:var(--parchment);color:var(--ink);font-family:var(--fon
 
 <header class="hero"><div class="hero-inner">
   <h1>Nearby Devices &amp; Network Health</h1>
-  <p>Automatic discovery, live link health, and an agent that pauses and resumes your transfer when the link degrades.</p>
+  <p>An agent on every device: it pairs over Bluetooth, encrypts the transfer, predicts link trouble before it happens, tunes itself, and explains every decision.</p>
+  <div class="caps" id="caps"></div>
 </div></header>
 
 <main class="content">
@@ -259,9 +296,35 @@ body{margin:0;background:var(--parchment);color:var(--ink);font-family:var(--fon
     </div>
   </section>
 
+  <section class="card" id="pairCard" hidden>
+    <h2 class="card-title">Pairing request</h2>
+    <div id="pairBody"></div>
+  </section>
+
   <section class="card">
     <h2 class="card-title">Current Transfer</h2>
     <div id="transferBody"><div class="transfer-idle">No active transfer</div></div>
+  </section>
+
+  <section class="card">
+    <h2 class="card-title">Agent &amp; AI</h2>
+    <div id="agentBody"><div class="transfer-idle">No active transfer</div></div>
+  </section>
+
+  <section class="card">
+    <h2 class="card-title">Ask the assistant</h2>
+    <div class="ask-row">
+      <input id="askInput" class="input" placeholder="Why did my transfer slow down?"
+             onkeydown="if(event.key==='Enter')ask()">
+      <button class="btn-primary" onclick="ask()">Ask</button>
+    </div>
+    <div class="chips">
+      <span class="chip" onclick="ask(this.textContent)">Why did it pause?</span>
+      <span class="chip" onclick="ask(this.textContent)">Why this window size?</span>
+      <span class="chip" onclick="ask(this.textContent)">Is this encrypted?</span>
+      <span class="chip" onclick="ask(this.textContent)">What does the model predict?</span>
+    </div>
+    <div id="answer" class="answer" hidden></div>
   </section>
 
   <section class="card">
@@ -362,14 +425,73 @@ async function tick(){
       ? `<span class="tag-sim">simulating degradation · ${Math.ceil(t.simulation_remaining_sec)}s</span>` : '';
     body.innerHTML = `
       <div class="transfer-active">
-        <div class="t-name">${escapeHtml(t.file_id)} → ${escapeHtml(t.peer_name || '')}</div>
+        <div class="t-name">${escapeHtml(t.file_id)} → ${escapeHtml(t.peer_name || '')}
+          ${t.encrypted ? '<span class="tag-lock">encrypted</span>' : '<span class="tag-open">not encrypted</span>'}
+          ${t.pair_code ? `<span class="tag-sim">code ${escapeHtml(t.pair_code)}</span>` : ''}</div>
         <div class="progress-track"><div class="progress-fill" style="width:${t.progress_pct}%"></div></div>
         <div class="t-row"><span>${t.acked_chunks} / ${t.total_chunks} chunks (${t.progress_pct}%)</span>
           <span class="status-pill ${t.status}">${t.status}</span></div>
-        <div class="t-row"><span>Pauses: ${t.pauses} · Resumes: ${t.resumes}</span><span></span></div>
+        <div class="t-row"><span>Pauses: ${t.pauses} · Resumes: ${t.resumes} · ${t.goodput_mbps} Mbps · window ${t.window}</span><span></span></div>
         ${healthHtml}
         ${active ? `<div class="t-actions"><button type="button" class="btn-secondary" onclick="simulate()">Simulate link degradation (8 s)</button>${sim}</div>` : ''}
       </div>`;
+  }
+
+  const caps = s.capabilities || {};
+  const capEl = document.querySelector('#caps');
+  if (capEl) {
+    const model = caps.model ? `model: AUC ${caps.model.test_auc} (${caps.model.rows} rows)` : 'model: none (rules only)';
+    capEl.innerHTML = [
+      `discovery: ${caps.discovery || 'multicast'}`,
+      `${caps.encryption}`,
+      model,
+      `learning: ${caps.learning ? 'on' : 'off'}`,
+      `assistant: ${caps.assistant}`,
+      caps.metrics_log ? 'logging metrics' : null
+    ].filter(Boolean).map(c => `<span class="cap">${escapeHtml(c)}</span>`).join('');
+  }
+
+  const pp = s.pending_pair;
+  const pairCard = document.querySelector('#pairCard');
+  if (pp) {
+    pairCard.hidden = false;
+    document.querySelector('#pairBody').innerHTML = `
+      <div class="pair-card">
+        <div>${escapeHtml(pp.peer_name)} wants to send you a file. Check that this code matches the one on their screen:</div>
+        <div class="pair-code">${escapeHtml(pp.code)}</div>
+        <div class="pair-actions">
+          <button class="btn-primary" onclick="confirmPair('${escapeHtml(pp.peer_id)}', true)">Codes match — pair</button>
+          <button class="btn-secondary" onclick="confirmPair('${escapeHtml(pp.peer_id)}', false)">They don't match</button>
+        </div>
+      </div>`;
+  } else {
+    pairCard.hidden = true;
+  }
+
+  const agent = s.agent || {};
+  const ab = document.querySelector('#agentBody');
+  if (!agent.forecast && !agent.health && !(agent.decisions || []).length) {
+    ab.innerHTML = '<div class="transfer-idle">No active transfer</div>';
+  } else {
+    const f = agent.forecast;
+    const riskPct = f ? Math.round(f.risk * 100) : 0;
+    const riskClass = riskPct >= 65 ? 'bad' : (riskPct >= 35 ? 'warn' : '');
+    const tn = agent.tuner;
+    const arms = (tn && tn.arms || []).filter(a => a.pulls > 0).slice(0, 4)
+      .map(a => `<div class="arm-row"><span>${escapeHtml(a.arm)}</span><span>${a.avg_mbps ?? '—'} Mbps · ${a.pulls}x</span></div>`).join('');
+    ab.innerHTML = `
+      <div class="grid2">
+        <div class="stat"><div class="k">Predicted throughput (${f ? f.horizon_sec : 5}s ahead)</div>
+          <div class="v">${f ? f.throughput_mbps + ' Mbps' : '—'}</div></div>
+        <div class="stat"><div class="k">Risk the link becomes unusable</div>
+          <div class="v">${f ? riskPct + '%' : '—'}</div>
+          <div class="risk-track"><div class="risk-fill ${riskClass}" style="width:${riskPct}%"></div></div></div>
+        <div class="stat"><div class="k">Window / compression</div>
+          <div class="v">${(s.transfer && s.transfer.window) || '—'} · ${(s.transfer && s.transfer.compression) ? 'on' : 'off'}</div></div>
+        <div class="stat"><div class="k">Transport</div>
+          <div class="v">${agent.transport ? escapeHtml(agent.transport.detail) : ((s.transfer && s.transfer.transport) || 'wifi')}</div></div>
+      </div>
+      ${arms ? `<div style="margin-top:14px"><div class="k" style="font-size:12px;color:var(--ink-muted-48)">What the tuner has learned (${tn.updates} updates)</div>${arms}</div>` : ''}`;
   }
 
   const inc = s.incoming;
@@ -381,7 +503,8 @@ async function tick(){
                : inc.status === 'COMPLETE' ? 'Saved to ' + inc.dest_path : 'Every chunk is checked with SHA-256 before it is written.';
     incBody.innerHTML = `
       <div class="transfer-active">
-        <div class="t-name">${escapeHtml(inc.name)} ← ${escapeHtml(inc.sender)}</div>
+        <div class="t-name">${escapeHtml(inc.name)} ← ${escapeHtml(inc.sender)}
+          ${inc.encrypted ? '<span class="tag-lock">encrypted</span>' : '<span class="tag-open">not encrypted</span>'}</div>
         <div class="progress-track"><div class="progress-fill" style="width:${inc.progress_pct}%"></div></div>
         <div class="t-row"><span>${inc.received} / ${inc.total_chunks} chunks (${inc.progress_pct}%) · ${(inc.size/1048576).toFixed(1)} MB</span>
           <span class="status-pill ${inc.status}">${inc.status}</span></div>
@@ -404,6 +527,28 @@ async function sendFile(){
     body: JSON.stringify({peer_id, file_path})});
   const out = await res.json();
   if(out.error) alert('Send failed: ' + out.error);
+}
+
+async function confirmPair(peerId, accepted){
+  await fetch('/api/pair', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({peer_id: peerId, accepted})});
+}
+
+async function ask(preset){
+  const box = document.querySelector('#askInput');
+  const question = preset || box.value;
+  if(!question) return;
+  if(preset) box.value = preset;
+  const out = document.querySelector('#answer');
+  out.hidden = false; out.textContent = 'Thinking…';
+  try {
+    const res = await fetch('/api/ask', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({question})});
+    const data = await res.json();
+    out.textContent = data.answer + (data.backend ? `\n\n— answered ${data.backend === 'llm' ? 'by the language model' : 'from the agent decision log'}` : '');
+  } catch(e) {
+    out.textContent = 'Could not reach the assistant.';
+  }
 }
 
 async function simulate(){

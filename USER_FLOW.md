@@ -27,28 +27,35 @@ connect the other two to it.**
 
 **Why a hotspot you control, instead of the venue's Wi-Fi:** some public/college/event Wi-Fi networks block device-to-device discovery on purpose (a security feature called "client isolation"). A hotspot from one of your own laptops avoids that risk entirely — don't discover this problem live during judging.
 
-## Step 2 — Start PathSense on each laptop
+## Step 2 — Start NetShare on each laptop
 
-Open a terminal on each laptop, go into the `pathsense` project folder, and run:
+Open a terminal on each laptop, go into the project folder, and run:
 
 ```
 # On Laptop A:
-python3 -m pathsense.node --name "Laptop A" --dashboard-port 8801
+python -m pathsense.node --name "Laptop A" --dashboard-port 8801
 
 # On Laptop B:
-python3 -m pathsense.node --name "Laptop B" --dashboard-port 8801
-
-# On Laptop C:
-python3 -m pathsense.node --name "Laptop C" --dashboard-port 8801
+python -m pathsense.node --name "Laptop B" --dashboard-port 8801
 ```
 
-(Use whichever names you want judges to see — they show up in the dashboard exactly as typed.) Each laptop prints something like:
+The first time, Windows asks whether to allow Python through the firewall —
+tick **both** Private and Public, or the laptops will not see each other.
 
-```
-PathSense node 'Laptop A' running. Dashboard: http://localhost:8801
-```
+The startup lines tell you exactly what this machine can do: which discovery it
+is using (Bluetooth or UDP multicast), whether encryption is available, whether
+a trained prediction model was found, and whether the learning tuner is on. Read
+them out during the demo; they are the honest capability list for that laptop.
 
-Leave that terminal window open and running on all 3 laptops for the whole demo.
+Optional switches worth knowing for the review:
+
+- `--discovery ble` — force Bluetooth discovery (falls back with a message if
+  the radio or its libraries are missing).
+- `--discovery ble-sim` — run the real BLE beacon format over the network
+  instead of the radio, clearly labelled, for machines with no usable Bluetooth
+  stack.
+- `--no-encryption` — run one laptop in plaintext to show the difference.
+- `--log-metrics data/links.csv` — record measurements to train the model on.
 
 ## Step 3 — Open the dashboard
 
@@ -62,25 +69,38 @@ Within a few seconds, the other two laptops will appear automatically in the "Ne
 
 You'll see each nearby device's live latency, packet loss, throughput, and a computed "score" updating continuously — this is the system actively measuring the network in real time, not a static list.
 
-## Step 4 — Send a file
+## Step 4 — Send a file and confirm the pairing code
 
-On the dashboard:
-1. Pick a peer from the dropdown ("Peer:").
-2. Type the **full file path** of a file that exists on that specific laptop (e.g., `/home/you/demo_video.mp4` on Mac/Linux, or `C:\Users\you\demo_video.mp4` on Windows).
+On Laptop A's dashboard:
+
+1. Pick Laptop B from the dropdown.
+2. Click **Browse…** and choose a file (1 GB or more so the transfer lasts long
+   enough to interrupt), or type its full path.
 3. Click **Send**.
 
-The "Current Transfer" panel shows live progress, the receiver's link health in plain words, and the pause/resume counters. The "Agent Decisions" log shows the system's own running commentary, starting with the link check for the receiver you picked.
+Both laptops now show the same **6-digit code**. On Laptop B, press **"Codes
+match — pair"**. Nothing is sent until that happens, and after this first time
+the two devices remember each other and pair silently.
 
-Use a big file (1 GB or more) so the transfer lasts long enough to demo.
+Say this while it happens: the code comes from an X25519 key exchange, and it is
+derived from *both* public keys, so if anyone had swapped a key in the middle the
+two screens would show different numbers. Once confirmed, every byte is
+AES-256-GCM encrypted, which the dashboard shows as an "encrypted" badge on both
+sides.
 
-## Step 5 — The live "wow" moment: pause and resume on the same receiver
+The **Agent & AI** panel then shows the model's forecast (throughput 5 s ahead
+and the risk the link fails), the window size and compression the learning tuner
+has chosen, and what it has learned so far.
 
-While a transfer is running, make the receiver's link bad in one of two ways:
+## Step 5 — The live moment: pause and resume on the same receiver
 
-- **Real (best):** turn off Wi-Fi on the receiving laptop for about 10 seconds, then turn it back on. You can also walk it far from the hotspot.
-- **Simulated (backup, if the room's network is too good to degrade):** click **Simulate link degradation (8 s)** in the Current Transfer panel. It injects clearly labelled fake bad measurements ("simulated" tag) for 8 seconds. The pause and resume that follow are real.
+While the transfer runs, make the receiver's link bad:
 
-After a few consecutive bad readings (the delay is deliberate, so one blip never pauses a transfer), the log shows something like:
+- **Real (best):** turn off Wi-Fi on Laptop B for about 10 seconds, then back on.
+- **Simulated (backup):** click **Simulate link degradation (8 s)**. It injects
+  clearly labelled fake measurements; the pause and resume that follow are real.
+
+The log shows something like:
 
 ```
 12:49:52 — Link to Laptop B degraded: packet loss 40% exceeds 15%. Pausing at 41% (chunk 7809/19200); progress kept.
@@ -88,7 +108,33 @@ After a few consecutive bad readings (the delay is deliberate, so one blip never
 12:50:03 — Transfer complete: all 19200 chunks verified after 1 pause(s) and 1 resume(s).
 ```
 
-The file always stays with the receiver you chose. It never gets sent to a different device.
+If the trained model is loaded you may instead see the agent act *early*:
+
+```
+12:49:50 — Predicted degradation on Laptop B's link: 86% risk within 5s (forecast 1.8 Mbps). Pausing early at 38% instead of waiting for it to stall.
+```
+
+Laptop B shows the mirror image in **Incoming Transfer**: RECEIVING →
+INTERRUPTED ("chunks already received are kept") → COMPLETE with the saved path.
+
+## Step 6 — Ask the assistant
+
+In **Ask the assistant**, type "Why did my transfer slow down?" or press one of
+the suggested questions. It answers from the agent's own decision log and says
+whether the answer came from the local explainer or a language model. Point out
+that it only explains decisions and never makes them — control has to be fast,
+repeatable and work with no internet.
+
+## Step 7 — Show the evidence
+
+```
+python tools/evaluate.py --trials 6 --mb 6
+```
+
+Three policies (no agent, Review 2 rules, Review 3 AI) over identical seeded
+link conditions, with the charts in `results/`. Quote the numbers from
+README.md and be straight about the two caveats: the link is simulated at the
+application level, and the AI figure is a warmed-up agent.
 
 ## What this demonstrates, in one sentence for judges
 
@@ -107,7 +153,9 @@ The file always stays with the receiver you chose. It never gets sent to a diffe
 
 ## What NOT to promise judges (matches TRD.md §12/§14 — stay honest here)
 
-- The transfer channel in this MVP is **not encrypted** — say so if asked; it's a documented, deliberate scope decision (Phase 2 item), not a hidden gap.
+- Transfers **are** encrypted now (AES-256-GCM after pairing), but only if the `cryptography` package is installed — the dashboard says plainly when it is not.
+- Bluetooth **discovery** is real where the radio and its libraries are available; `--discovery ble-sim` carries the same beacon format over the network and is labelled as simulated. The Bluetooth **fallback transport** uses real RFCOMM on Linux/macOS and a speed-limited stand-in on Windows, labelled "emulated".
+- The prediction model is trained on **simulated** link traces unless you have collected real ones with `--log-metrics`. Its gain over the naive baseline is real but modest (AUC 0.72 vs 0.51) — quote it as that, not as magic.
 - The agent does **not** switch the file to another device. It pauses and resumes on the receiver you chose (Review 2 design change). Picking a better path to the same receiver (Wi-Fi Direct or Bluetooth fallback) and the AI prediction and tuning are Review 3 work.
 - **Simulate link degradation** fakes the *measurements* only, and the dashboard labels it as simulated. Say so if you use it.
 - This runs over your own local Wi-Fi/hotspot — it does not require the internet, but it also isn't built to work across two networks that aren't sharing one hotspot/router (that's a named Phase 2 item, not a bug).
