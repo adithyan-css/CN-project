@@ -25,8 +25,10 @@ itself is exchanged when the two devices connect, and the 6-digit pairing code
 
 Radios and platforms. Scanning uses `bleak`, which works on Windows, macOS and
 Linux. Advertising (acting as a peripheral) is not supported by bleak, so on
-Windows it uses WinRT's BluetoothLEAdvertisementPublisher through the `winsdk`
-package, and on Linux BlueZ via `bluetoothctl`/`hcitool`. Neither is available
+Windows it uses WinRT's BluetoothLEAdvertisementPublisher through whichever
+WinRT binding is installed (`winrt-windows-devices-bluetooth-advertisement`,
+which bleak pulls in, or the older `winsdk`), and on Linux BlueZ via
+`bluetoothctl`/`hcitool`. Neither is available
 in every environment, so every backend reports what it can do and the node
 falls back to UDP multicast discovery with a clear message rather than
 pretending the radio is there. The payload codec and the peer bookkeeping
@@ -118,20 +120,36 @@ class _BaseAdvertiser:
 
 
 class WindowsAdvertiser(_BaseAdvertiser):
-    """WinRT BluetoothLEAdvertisementPublisher (needs the `winsdk` package)."""
+    """WinRT BluetoothLEAdvertisementPublisher.
 
-    name = "winsdk"
+    The same Windows API ships under two package names: the newer, split
+    `winrt-windows-devices-bluetooth-advertisement` (which `bleak` installs as
+    a dependency, and which has wheels for current Python versions) and the
+    older all-in-one `winsdk`. `winsdk` has no wheel for Python 3.13, so pip
+    tries to compile it and fails without Visual Studio. Both are tried here,
+    newest first, so installing `bleak` alone is enough.
+    """
+
+    name = "winrt"
 
     def __init__(self):
-        try:                                           # pragma: no cover - Windows only
-            from winsdk.windows.devices.bluetooth.advertisement import (
-                BluetoothLEAdvertisementPublisher, BluetoothLEManufacturerData)
-            from winsdk.windows.storage.streams import DataWriter
-        except Exception as e:                         # pragma: no cover
-            raise AdvertiserUnavailable(f"winsdk not available: {e}")
-        self._pub_cls = BluetoothLEAdvertisementPublisher
-        self._mfg_cls = BluetoothLEManufacturerData
-        self._writer_cls = DataWriter
+        self._advertisement_mod = None
+        self._streams_mod = None
+        errors = []
+        for adv_mod, streams_mod, label in (
+                ("winrt.windows.devices.bluetooth.advertisement", "winrt.windows.storage.streams", "winrt"),
+                ("winsdk.windows.devices.bluetooth.advertisement", "winsdk.windows.storage.streams", "winsdk")):
+            try:                                       # pragma: no cover - Windows only
+                import importlib
+                self._advertisement_mod = importlib.import_module(adv_mod)
+                self._streams_mod = importlib.import_module(streams_mod)
+                self.name = label
+                break
+            except Exception as e:                     # pragma: no cover
+                errors.append(f"{label}: {e}")
+        if self._advertisement_mod is None:            # pragma: no cover
+            raise AdvertiserUnavailable(
+                "no WinRT Bluetooth module (" + "; ".join(errors) + "). Install bleak: pip install bleak")
         self._publisher = None
         self._local_name = ""
 
@@ -139,15 +157,14 @@ class WindowsAdvertiser(_BaseAdvertiser):
         # Windows refuses an advertisement that sets LocalName from a normal
         # (non-elevated, non-peripheral-role) app — it answers "The parameter
         # is incorrect". Only the manufacturer-data section is published; the
-        # friendly name is read from the device over the scan response, and
-        # BeaconPayload carries the device id either way.
+        # device id travels inside BeaconPayload either way.
         self._local_name = local_name
-        writer = self._writer_cls()
+        writer = self._streams_mod.DataWriter()
         writer.write_bytes(payload)
-        section = self._mfg_cls()
+        section = self._advertisement_mod.BluetoothLEManufacturerData()
         section.company_id = MANUFACTURER_ID
         section.data = writer.detach_buffer()
-        publisher = self._pub_cls()
+        publisher = self._advertisement_mod.BluetoothLEAdvertisementPublisher()
         publisher.advertisement.manufacturer_data.append(section)
         try:
             publisher.start()
