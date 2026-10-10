@@ -81,7 +81,7 @@ class TransferState:
     total_chunks: int
     acked_chunks: set
     peer_id: str
-    status: str = "IDLE"   # IDLE|PAIRING|TRANSFERRING|PAUSED|DEGRADED|COMPLETE|FAILED
+    status: str = "IDLE"   # IDLE|PAIRING|TRANSFERRING|PAUSED|DEGRADED|COMPLETE|FAILED|CANCELLED
     started_at: float = 0.0
     bytes_per_sec_ema: float = 0.0
     pauses: int = 0
@@ -383,6 +383,8 @@ class TransferSender:
 
     # ---- the session -----------------------------------------------------
     def send_to(self, peer_id: str, ip: str, port: int, transport=None) -> bool:
+        if self.aborted:
+            return False
         with self._session_lock:
             return self._send_to_locked(peer_id, ip, port, transport or self.transport)
 
@@ -462,7 +464,7 @@ class TransferSender:
         except (OSError, ConnectionError, ValueError, KeyError, json.JSONDecodeError) as e:
             if isinstance(e, ValueError) and "bound to receiver" in str(e):
                 raise
-            self.state.status = "DEGRADED"
+            self.state.status = "CANCELLED" if self.aborted else "DEGRADED"
             self._emit()
             return False
         finally:
@@ -527,7 +529,7 @@ class TransferSender:
                     self._window_sem_lock.wait(0.2)
 
             if self._cancel_current.is_set():
-                self.state.status = "PAUSED"
+                self.state.status = "CANCELLED" if self.aborted else "PAUSED"
                 self._emit()
                 return False
             if failed:
@@ -540,7 +542,10 @@ class TransferSender:
             self._emit()
             return done
         except (OSError, ConnectionError) as e:
-            self.state.status = "PAUSED" if self._cancel_current.is_set() else "DEGRADED"
+            if self.aborted:
+                self.state.status = "CANCELLED"
+            else:
+                self.state.status = "PAUSED" if self._cancel_current.is_set() else "DEGRADED"
             self._emit()
             return False
         finally:
@@ -571,3 +576,18 @@ class TransferSender:
         with self._lock:
             self.state.pauses += 1
         self.cancel_current()
+
+    def abort(self) -> None:
+        """Give up on this transfer for good (the user pressed Cancel).
+
+        Unlike pause(), this is terminal: the adaptation loop stops retrying
+        and the sender refuses to send anything more, so a transfer that can
+        never connect does not retry forever."""
+        self._aborted = True
+        self.state.status = "CANCELLED"
+        self.cancel_current()
+        self._emit()
+
+    @property
+    def aborted(self) -> bool:
+        return getattr(self, "_aborted", False)

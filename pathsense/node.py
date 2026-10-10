@@ -126,7 +126,7 @@ class Node:
             self.log(f"Learning tuner active ({self.tuner.updates} updates remembered)")
         srv = make_dashboard_server(self.dashboard_port, self._state, self._handle_send,
                                     DASHBOARD_HTML, self._browse, self._handle_simulate,
-                                    self._handle_pair, self._handle_ask)
+                                    self._handle_pair, self._handle_ask, self._handle_cancel)
         start_dashboard_thread(srv)
         self.log(f"Dashboard on http://0.0.0.0:{self.dashboard_port}")
 
@@ -203,6 +203,18 @@ class Node:
         self.log(f"[DEMO] Simulating link degradation to {self._peer_names().get(pid, pid)} for {seconds:.0f}s")
         return {"status": "simulating", "seconds": seconds}
 
+    def _handle_cancel(self, payload: dict) -> dict:
+        """Stop the current transfer for good (the Cancel button)."""
+        if not self.current_sender or self.current_sender.state.status in ("COMPLETE", "CANCELLED"):
+            return {"error": "no transfer to cancel"}
+        name = self._peer_names().get(self.current_sender.state.peer_id, "the receiver")
+        progress = self.current_sender.state.progress_pct
+        if self.current_loop:
+            self.current_loop.stop()
+        self.current_sender.abort()
+        self.log(f"Transfer to {name} cancelled by the user at {progress:.0f}%.")
+        return {"status": "cancelled"}
+
     def _handle_pair(self, payload: dict) -> dict:
         """The receiving user pressed 'the codes match' (or 'they don't')."""
         peer_id = payload.get("peer_id")
@@ -236,7 +248,7 @@ class Node:
                              f"join the same Wi-Fi or hotspot"}
         if self.current_sender and self.current_sender.state.status in ("TRANSFERRING", "PAUSED",
                                                                        "DEGRADED", "PAIRING"):
-            return {"error": "a transfer is already in progress"}
+            return {"error": "a transfer is already in progress — cancel it first"}
         if self.current_loop:
             self.current_loop.stop()
         names = self._peer_names()

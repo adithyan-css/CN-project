@@ -166,9 +166,19 @@ class EmulatedBluetoothTransport(TcpTransport):
         return ThrottledSocket(super().connect(address, port), self.mbps)
 
 
-def fallback_transport(prefer_real: bool = True) -> tuple[object, TransportInfo]:
-    """Pick the best non-Wi-Fi transport this machine can actually use."""
-    if prefer_real:
+def fallback_transport(bt_address: Optional[str] = None) -> tuple[object, TransportInfo]:
+    """Pick the best non-Wi-Fi transport that can actually reach this peer.
+
+    An RFCOMM socket needs the peer's BLUETOOTH address (and an RFCOMM service
+    on the other side) — it cannot dial an IP address. Python on Windows does
+    expose AF_BLUETOOTH, so an earlier version happily selected RFCOMM and then
+    tried to connect to an IPv4 address, which failed instantly and produced an
+    endless drop/retry loop. The real transport is therefore only used when a
+    Bluetooth address is actually known; otherwise the paced TCP stand-in runs,
+    which reaches the peer over IP at Bluetooth-like speed and is labelled as
+    emulated everywhere it is shown.
+    """
+    if bt_address:
         try:
             t = RfcommTransport()
             return t, t.info()

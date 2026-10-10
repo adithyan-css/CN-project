@@ -58,6 +58,11 @@ PREDICTIVE_TICKS = 3
 CAUTION_RISK = 0.55
 TUNE_INTERVAL_SEC = 4.0
 WIFI_FAILURES_BEFORE_FALLBACK = 2
+# Reconnect attempts are spaced out and eventually given up on. Without this a
+# receiver that can never be reached produces an endless drop/resume loop that
+# fills the log and never makes progress.
+MAX_CONNECT_FAILURES = 8
+RETRY_BACKOFF_SEC = (1.0, 2.0, 4.0, 8.0, 15.0)
 
 
 @dataclasses.dataclass
@@ -131,8 +136,11 @@ class AdaptationLoop:
         self._waiting_announced = False
         self._resume_thread: Optional[threading.Thread] = None
         self._wifi_failures = 0
+        self._consecutive_failures = 0
+        self._next_retry_at = 0.0
         self._fallback_transport = None
         self._last_tune = 0.0
+        self._last_acked = 0
         self._rule_reference_mbps = 0.0
         self._stop = threading.Event()
 
@@ -158,6 +166,8 @@ class AdaptationLoop:
                 break
             if status == "FAILED":
                 self.on_event("Transfer failed: the receiver declined the file or the pairing was refused.")
+                break
+            if status == "CANCELLED":
                 break
             self._tick()
 
@@ -209,9 +219,18 @@ class AdaptationLoop:
             self._announced_drop = True
             self._pause_requested = True
             self._wifi_failures += 1
-            self._record("pause", f"Connection to {name} dropped at {self._progress()}. "
-                                  f"Progress is kept; the agent will resume when the link recovers.",
-                         health, forecast)
+            self._consecutive_failures += 1
+            wait = RETRY_BACKOFF_SEC[min(self._consecutive_failures - 1, len(RETRY_BACKOFF_SEC) - 1)]
+            self._next_retry_at = now + wait
+            if self._consecutive_failures >= MAX_CONNECT_FAILURES:
+                self._record("pause", f"Giving up on {name} after {self._consecutive_failures} failed attempts "
+                                      f"at {self._progress()}. Check the receiver is running and reachable, "
+                                      f"then send the file again.", health, forecast)
+                self.sender.abort()
+                return
+            self._record("pause", f"Connection to {name} dropped at {self._progress()}. Progress is kept; "
+                                  f"retrying in {wait:.0f}s (attempt {self._consecutive_failures} of "
+                                  f"{MAX_CONNECT_FAILURES}).", health, forecast)
 
         resuming = self._resume_thread is not None and self._resume_thread.is_alive()
         paused = self._pause_requested or st.status in ("PAUSED", "DEGRADED")
@@ -244,6 +263,8 @@ class AdaptationLoop:
             return
 
         if action == RESUME and paused and not resuming:
+            if now < self._next_retry_at:
+                return                      # still inside the backoff window
             peer = next((p for p in self.discovery.get_peers() if p.device_id == pid), None)
             if peer is None:
                 if not self._waiting_announced:
@@ -262,6 +283,10 @@ class AdaptationLoop:
             self._resume_thread.start()
             return
 
+        if st.status == "TRANSFERRING" and len(st.acked_chunks) > self._last_acked:
+            self._last_acked = len(st.acked_chunks)
+            self._consecutive_failures = 0        # real progress: start the retry budget over
+
         if st.status == "TRANSFERRING" and self.tuner and (now - self._last_tune) >= TUNE_INTERVAL_SEC:
             self._tune(name, forecast, samples, now)
         elif (st.status == "TRANSFERRING" and forecast and not self.tuner
@@ -274,7 +299,9 @@ class AdaptationLoop:
         if not self.enable_fallback or self._wifi_failures < WIFI_FAILURES_BEFORE_FALLBACK:
             return None, ""
         if self._fallback_transport is None:
-            self._fallback_transport, info = fallback_transport()
+            # The BLE beacon carries an IPv4 address, not a Bluetooth MAC, so
+            # there is no address to dial RFCOMM with — see fallback_transport.
+            self._fallback_transport, info = fallback_transport(bt_address=None)
             self.transport_info = info
             self._record("transport",
                          f"Wi-Fi to {name} has failed {self._wifi_failures} times; switching the rest of "

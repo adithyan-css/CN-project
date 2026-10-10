@@ -16,10 +16,11 @@ def make_dashboard_server(port: int, state_provider: Callable[[], dict],
                            browse_handler: Optional[Callable[[Optional[str]], dict]] = None,
                            simulate_handler: Optional[Callable[[dict], dict]] = None,
                            pair_handler: Optional[Callable[[dict], dict]] = None,
-                           ask_handler: Optional[Callable[[dict], dict]] = None) -> ThreadingHTTPServer:
+                           ask_handler: Optional[Callable[[dict], dict]] = None,
+                           cancel_handler: Optional[Callable[[dict], dict]] = None) -> ThreadingHTTPServer:
     post_routes = {"/api/send": send_handler}
     for path, handler in (("/api/simulate", simulate_handler), ("/api/pair", pair_handler),
-                          ("/api/ask", ask_handler)):
+                          ("/api/ask", ask_handler), ("/api/cancel", cancel_handler)):
         if handler is not None:
             post_routes[path] = handler
 
@@ -202,6 +203,10 @@ body{margin:0;background:var(--parchment);color:var(--ink);font-family:var(--fon
 .status-pill.DEGRADED,.status-pill.FAILED{color:var(--status-bad);background:rgba(217,45,32,0.08)}
 .status-pill.IDLE{color:var(--ink-muted-48);background:var(--divider-soft)}
 .status-pill.PAUSED,.status-pill.INTERRUPTED{color:#b25e00;background:rgba(230,126,0,0.10)}
+.status-pill.CANCELLED{color:var(--ink-muted-48);background:var(--divider-soft)}
+.btn-danger{border:1px solid rgba(217,45,32,0.35);background:#fff;color:var(--status-bad);
+  border-radius:9999px;padding:6px 14px;font-size:13px;font-weight:600;cursor:pointer}
+.btn-danger:hover{background:rgba(217,45,32,0.06)}
 .status-pill.RECEIVING{color:var(--primary);background:rgba(0,102,204,0.08)}
 .health{font-size:13px;letter-spacing:-0.2px;margin-top:10px;color:var(--ink-muted-80)}
 .health.good b{color:var(--status-good)}
@@ -339,11 +344,14 @@ body{margin:0;background:var(--parchment);color:var(--ink);font-family:var(--fon
 </main>
 
 <footer class="footer">
-  Review 2 prototype. A transfer always stays with the receiver you picked: when the link
-  degrades the agent pauses it, keeps every verified chunk, and resumes from the first missing
-  chunk once the link recovers. "Simulate link degradation" injects clearly labelled fake
-  measurements for a demo on a healthy network. Transfer channel is plaintext (encryption is
-  planned for Review 3); auto-accept is on. The file browser is for a trusted demo network only.
+  A transfer always stays with the receiver you picked: when the link degrades the agent pauses
+  it, keeps every verified chunk, and resumes from the first missing chunk once the link recovers.
+  After pairing, every byte is AES-256-GCM encrypted — the badge above says so for each transfer,
+  and says "not encrypted" when the key exchange did not happen or the cryptography package is
+  missing. "Simulate link degradation" injects clearly labelled fake measurements for a demo on a
+  healthy network, and the Bluetooth fallback is emulated on platforms where Python cannot open an
+  RFCOMM socket. Incoming files are auto-accepted from paired devices; the file browser is for a
+  trusted demo network only.
 </footer>
 
 <div class="modal-backdrop" id="browseModal" hidden>
@@ -433,7 +441,7 @@ async function tick(){
           <span class="status-pill ${t.status}">${t.status}</span></div>
         <div class="t-row"><span>Pauses: ${t.pauses} · Resumes: ${t.resumes} · ${t.goodput_mbps} Mbps · window ${t.window}</span><span></span></div>
         ${healthHtml}
-        ${active ? `<div class="t-actions"><button type="button" class="btn-secondary" onclick="simulate()">Simulate link degradation (8 s)</button>${sim}</div>` : ''}
+        ${active ? `<div class="t-actions"><button type="button" class="btn-secondary" onclick="simulate()">Simulate link degradation (8 s)</button><button type="button" class="btn-danger" onclick="cancelTransfer()">Cancel transfer</button>${sim}</div>` : ''}
       </div>`;
   }
 
@@ -549,6 +557,14 @@ async function ask(preset){
   } catch(e) {
     out.textContent = 'Could not reach the assistant.';
   }
+}
+
+async function cancelTransfer(){
+  if(!confirm('Cancel this transfer? Nothing more will be sent.')) return;
+  const res = await fetch('/api/cancel', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({})});
+  const out = await res.json();
+  if(out.error) alert('Cancel failed: ' + out.error);
 }
 
 async function simulate(){

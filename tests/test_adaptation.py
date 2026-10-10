@@ -184,10 +184,12 @@ def test_dropped_connection_resumes_automatically():
         time.sleep(0.3)
         try:
             _set_link(collector, "B", healthy=True)
-            loop._tick(); loop._tick()
-            deadline = time.time() + 10.0
+            # The agent backs off after a failed connection, so keep ticking
+            # until it retries rather than assuming it resumes immediately.
+            deadline = time.time() + 15.0
             while time.time() < deadline and sender.state.status != "COMPLETE":
-                time.sleep(0.05)
+                loop._tick()
+                time.sleep(0.2)
             assert sender.state.status == "COMPLETE"
             assert _sha256_file(os.path.join(recv_dir, "doc.bin")) == _sha256_file(src_path)
             print("PASS: test_dropped_connection_resumes_automatically")
@@ -197,8 +199,68 @@ def test_dropped_connection_resumes_automatically():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_unreachable_receiver_gives_up_instead_of_looping():
+    """Regression: a receiver that can never be connected to produced an endless
+    'dropped -> recovered -> resuming' loop in the live demo, because the link
+    METRICS stayed healthy while every TCP connection failed. The agent must
+    back off and eventually stop."""
+    tmp = tempfile.mkdtemp(prefix="ps_loop_")
+    try:
+        src = os.path.join(tmp, "x.bin")
+        with open(src, "wb") as f:
+            f.write(os.urandom(64 * 1024))
+        dead_port = 53999                         # nothing is listening here, ever
+        discovery = _StubDiscovery([PeerInfo("B", "Peer B", HOST, 0, dead_port, time.time())])
+        collector = MetricsCollector(discovery)
+        _set_link(collector, "B", healthy=True)   # the link looks fine the whole time
+
+        sender = TransferSender(src, chunk_size=4096)
+        events = []
+        clock = [time.time()]
+        loop = AdaptationLoop(collector, discovery, sender, {"B": "Peer B"}, on_event=events.append,
+                              watchdog=LinkWatchdog(pause_after=1, resume_after=1),
+                              clock=lambda: clock[0], enable_fallback=False)
+
+        assert sender.send_to("B", HOST, dead_port) is False
+        for _ in range(60):
+            if sender.state.status == "CANCELLED":
+                break
+            clock[0] += 30                        # skip past every backoff window
+            # keep the measurements fresh: the point of this test is that the
+            # LINK looks perfectly healthy while every connection attempt fails
+            collector._history["B"] = [PeerMetricsSample("B", 5.0, 1.0, 0.0, 80.0, clock[0])]
+            loop._tick()
+            t = loop._resume_thread
+            if t is not None:
+                t.join(timeout=5)
+        assert sender.state.status == "CANCELLED", f"agent never gave up (status={sender.state.status})"
+        assert any("giving up" in e.lower() for e in events), events
+        assert sender.state.resumes < 12, f"far too many retries: {sender.state.resumes}"
+        assert sender.send_to("B", HOST, dead_port) is False, "an aborted transfer must not restart"
+        print("PASS: test_unreachable_receiver_gives_up_instead_of_looping")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_user_cancel_stops_everything():
+    tmp = tempfile.mkdtemp(prefix="ps_cancel_")
+    try:
+        src = os.path.join(tmp, "y.bin")
+        with open(src, "wb") as f:
+            f.write(os.urandom(32 * 1024))
+        sender = TransferSender(src, chunk_size=4096)
+        sender.abort()
+        assert sender.state.status == "CANCELLED" and sender.aborted
+        assert sender.send_to("B", HOST, 53998) is False
+        print("PASS: test_user_cancel_stops_everything")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_watchdog_needs_consecutive_bad_ticks_to_pause()
     test_watchdog_needs_consecutive_good_ticks_to_resume()
     test_end_to_end_pause_and_resume_on_same_receiver()
     test_dropped_connection_resumes_automatically()
+    test_unreachable_receiver_gives_up_instead_of_looping()
+    test_user_cancel_stops_everything()
