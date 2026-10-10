@@ -136,16 +136,26 @@ class WindowsAdvertiser(_BaseAdvertiser):
         self._local_name = ""
 
     def start(self, payload: bytes, local_name: str) -> None:   # pragma: no cover
+        # Windows refuses an advertisement that sets LocalName from a normal
+        # (non-elevated, non-peripheral-role) app — it answers "The parameter
+        # is incorrect". Only the manufacturer-data section is published; the
+        # friendly name is read from the device over the scan response, and
+        # BeaconPayload carries the device id either way.
         self._local_name = local_name
         writer = self._writer_cls()
         writer.write_bytes(payload)
         section = self._mfg_cls()
         section.company_id = MANUFACTURER_ID
         section.data = writer.detach_buffer()
-        self._publisher = self._pub_cls()
-        self._publisher.advertisement.manufacturer_data.append(section)
-        self._publisher.advertisement.local_name = local_name
-        self._publisher.start()
+        publisher = self._pub_cls()
+        publisher.advertisement.manufacturer_data.append(section)
+        try:
+            publisher.start()
+        except OSError as e:
+            raise AdvertiserUnavailable(
+                f"Windows refused to start BLE advertising ({e}). This usually means the "
+                f"adapter does not support peripheral mode, or Bluetooth is turned off.") from e
+        self._publisher = publisher
 
     def stop(self) -> None:                                     # pragma: no cover
         if self._publisher is not None:
@@ -171,9 +181,12 @@ class BluezAdvertiser(_BaseAdvertiser):
         adv = bytes([len(data) + 1, 0xFF]) + data
         args = ["hcitool", "-i", "hci0", "cmd", "0x08", "0x0008",
                 f"{len(adv):02x}"] + [f"{b:02x}" for b in adv.ljust(31, b"\x00")]
-        subprocess.run(args, check=True, capture_output=True)
-        subprocess.run(["hcitool", "-i", "hci0", "cmd", "0x08", "0x000a", "01"],
-                       check=True, capture_output=True)
+        try:
+            subprocess.run(args, check=True, capture_output=True)
+            subprocess.run(["hcitool", "-i", "hci0", "cmd", "0x08", "0x000a", "01"],
+                           check=True, capture_output=True)
+        except (subprocess.CalledProcessError, OSError) as e:
+            raise AdvertiserUnavailable(f"BlueZ refused to advertise ({e}); root is usually required") from e
 
     def stop(self) -> None:                                     # pragma: no cover
         subprocess.run(["hcitool", "-i", "hci0", "cmd", "0x08", "0x000a", "00"],
@@ -187,6 +200,8 @@ def make_advertiser() -> _BaseAdvertiser:
             return cls()
         except AdvertiserUnavailable as e:
             errors.append(str(e))
+        except Exception as e:          # a radio backend must never crash the node
+            errors.append(f"{cls.name}: {e!r}")
     raise AdvertiserUnavailable("; ".join(errors) or "no BLE advertiser on this platform")
 
 
@@ -265,7 +280,12 @@ class BleDiscovery:
     # ---- radio -----------------------------------------------------------
     def start(self) -> bool:
         """Start advertising and scanning. Returns False if the radio is not
-        usable here (the caller then falls back to multicast discovery)."""
+        usable here (the caller then falls back to multicast discovery).
+
+        Nothing in here may raise: a missing library, a Bluetooth adapter that
+        cannot advertise, or a radio switched off are all ordinary situations,
+        and the node has to keep running over Wi-Fi when they happen.
+        """
         try:
             self._advertiser = make_advertiser()
             self._advertiser.start(self.payload().encode(), self.name)
@@ -273,15 +293,27 @@ class BleDiscovery:
         except AdvertiserUnavailable as e:
             self.on_event(f"Bluetooth advertising unavailable: {e}")
             return False
+        except Exception as e:
+            self.on_event(f"Bluetooth advertising failed to start ({e!r}); continuing without it")
+            self._safe_stop_advertiser()
+            return False
         try:                                           # pragma: no cover - needs a radio
             import bleak  # noqa: F401
         except Exception as e:
             self.on_event(f"Bluetooth scanning unavailable: {e} (pip install bleak)")
-            self._advertiser.stop()
+            self._safe_stop_advertiser()
             return False
         threading.Thread(target=self._scan_loop, daemon=True).start()   # pragma: no cover
         threading.Thread(target=self._readvertise_loop, daemon=True).start()
         return True
+
+    def _safe_stop_advertiser(self) -> None:
+        if self._advertiser is not None:
+            try:
+                self._advertiser.stop()
+            except Exception:
+                pass
+            self._advertiser = None
 
     def _readvertise_loop(self) -> None:               # pragma: no cover - needs a radio
         last = self.payload().encode()
@@ -311,8 +343,7 @@ class BleDiscovery:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._advertiser:
-            self._advertiser.stop()
+        self._safe_stop_advertiser()
 
 
 class SimulatedBleDiscovery(BleDiscovery):
